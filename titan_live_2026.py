@@ -18,7 +18,7 @@ USAGE (Kaggle):
 # ─────────────────────────────────────────────────────────────────────────────
 # IMPORTS
 # ─────────────────────────────────────────────────────────────────────────────
-import os, sys, json, pickle, math, warnings, io
+import os, sys, pickle, math, warnings, io
 from datetime import datetime
 from typing import List, Optional, Tuple
 warnings.filterwarnings('ignore')
@@ -35,6 +35,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.preprocessing import RobustScaler
+from titan_core.feature_contract import load_feature_schema
 
 try:
     import yfinance as yf
@@ -506,6 +507,30 @@ def build_features(forex: dict, macro: dict, common_idx: pd.Index) -> pd.DataFra
         sp_close = macro['sp500']['Close'].squeeze().reindex(common_idx).ffill().fillna(0)
         df["sp500_ret"] = sp_close.pct_change().fillna(0)
 
+    # 9. Regime-aware state features (Phase B)
+    pair_ret_cols = [f"{p}_ret_1" for p in PAIRS if f"{p}_ret_1" in df.columns]
+    fx_mean_ret = df[pair_ret_cols].mean(axis=1) if pair_ret_cols else pd.Series(0.0, index=df.index)
+    fx_dispersion = df[pair_ret_cols].std(axis=1).fillna(0) if pair_ret_cols else pd.Series(0.0, index=df.index)
+
+    fx_vol_20 = fx_mean_ret.rolling(20, min_periods=5).std().fillna(0)
+    vol_q = fx_vol_20.rolling(20 * 5, min_periods=20).rank(pct=True).fillna(0.5)
+    trend_fast = fx_mean_ret.ewm(span=12, adjust=False).mean()
+    trend_slow = fx_mean_ret.ewm(span=48, adjust=False).mean()
+    trend_strength = (trend_fast - trend_slow).fillna(0)
+
+    risk_proxy = (df.get("sp500_ret", 0) - df.get("gold_ret", 0))
+    if not isinstance(risk_proxy, pd.Series):
+        risk_proxy = pd.Series(float(risk_proxy), index=df.index)
+
+    df["regime_volatility_percentile"] = vol_q
+    df["regime_high_vol"] = (vol_q > 0.67).astype(np.float32)
+    df["regime_low_vol"] = (vol_q < 0.33).astype(np.float32)
+    df["regime_trend_strength"] = trend_strength
+    df["regime_trending"] = (trend_strength.abs() > trend_strength.rolling(96, min_periods=24).std().fillna(0)).astype(np.float32)
+    df["regime_risk_proxy"] = risk_proxy.fillna(0)
+    df["regime_risk_on"] = (risk_proxy.ewm(span=12, adjust=False).mean() > 0).astype(np.float32)
+    df["regime_cross_pair_dispersion"] = fx_dispersion
+
     return df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 
@@ -575,7 +600,7 @@ if __name__ == '__main__':
     print("=" * 60)
 
     # ── Load schema + scaler ──────────────────────────────────────────────
-    schema: dict = json.load(open(_find('titan_feature_schema.json')))
+    schema: dict = load_feature_schema(_find('titan_feature_schema.json'))
     feats_per_node: int = schema['feats_per_node']
     scaler: RobustScaler = pickle.load(open(_find('titan_scaler.pkl'), 'rb'))
     print(f"Schema loaded: {feats_per_node} features/node")
