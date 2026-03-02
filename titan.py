@@ -25,6 +25,7 @@ import pickle
 import os
 import io, sys
 from typing import Optional, Tuple, List
+from titan_core.feature_contract import save_feature_schema
 
 try:
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -907,8 +908,7 @@ def load_titan_dataset(path: str):
           f"Expired%={expire_total/(T_total*NUM_NODES+1)*100:.1f}")
 
 
-    # ── Save feature schema for live inference ───────────────────────────
-    import json
+    # ── Save strict feature schema for live inference ────────────────────
     schema_cols = {}
     for pair_i, p in enumerate(PAIRS):
         p_lo = p.lower()
@@ -917,11 +917,14 @@ def load_titan_dataset(path: str):
                   and (c.startswith(p) or c.startswith(p_lo))
                   and not c.startswith('target_')]
         schema_cols[p] = (p_cols + shared_cols)[:min_feats]
-    schema = {'pairs': PAIRS, 'feats_per_node': min_feats,
-              'shared_cols': shared_cols, 'node_cols': schema_cols}
-    with open('titan_feature_schema.json', 'w') as _sf:
-        json.dump(schema, _sf)
 
+    save_feature_schema(
+        'titan_feature_schema.json',
+        pairs=PAIRS,
+        feats_per_node=min_feats,
+        shared_cols=shared_cols,
+        node_cols=schema_cols,
+    )
     print(f"    Master tensor: {master.shape} | feats/node: {feats_per_node}")
     print(f"    Pairs: {PAIRS} | shared cols: {len(shared_cols)}")
     return master, future_rets, feats_per_node, df.index

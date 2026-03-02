@@ -12,7 +12,7 @@ REQUIREMENTS:
   pip install MetaTrader5 yfinance pandas numpy torch scikit-learn
 """
 
-import os, sys, json, pickle, math, time
+import os, sys, pickle, math, time
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -23,6 +23,7 @@ import torch.optim as optim
 from sklearn.preprocessing import RobustScaler
 import MetaTrader5 as mt5
 import yfinance as yf
+from titan_core.feature_contract import load_feature_schema
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -347,7 +348,7 @@ def open_position(pair: str, signal: float, balance: float):
 def load_artifacts():
     if not os.path.exists(MODEL_PATH) or not os.path.exists(SCALER_PATH) or not os.path.exists(SCHEMA_PATH):
         raise FileNotFoundError(f"Missing artifacts:\n{MODEL_PATH}\n{SCALER_PATH}\n{SCHEMA_PATH}")
-    schema = json.load(open(SCHEMA_PATH))
+    schema = load_feature_schema(SCHEMA_PATH)
     scaler = pickle.load(open(SCALER_PATH, 'rb'))
     
     model = NestedGraphTitanNL(num_nodes=NUM_NODES, feats_per_node=schema['feats_per_node'],
@@ -439,6 +440,49 @@ def run_daily_cycle():
             s = pd.Series(0.0, index=idx)
         macro_closes[col_name] = s.values.astype(np.float32)
 
+    # Regime-aware shared features (Phase B) built from available live bars
+    ret_map = {}
+    for pair in PAIRS:
+        pair_df = forex.get(pair, pd.DataFrame(index=idx)).reindex(idx).ffill().fillna(0.0)
+        if 'Close' in pair_df.columns:
+            ret_map[pair] = np.log((pair_df['Close'].values.astype(np.float32) + 1e-8) /
+                                   (np.roll(pair_df['Close'].values.astype(np.float32), 1) + 1e-8))
+            ret_map[pair][0] = 0.0
+        else:
+            ret_map[pair] = np.zeros(len(idx), dtype=np.float32)
+
+    ret_stack = np.stack([ret_map[p] for p in PAIRS], axis=1)
+    fx_mean_ret = ret_stack.mean(axis=1)
+    fx_dispersion = ret_stack.std(axis=1)
+    fx_vol_20 = pd.Series(fx_mean_ret, index=idx).rolling(20, min_periods=5).std().fillna(0).values.astype(np.float32)
+    vol_q = pd.Series(fx_vol_20, index=idx).rolling(20 * 5, min_periods=20).rank(pct=True).fillna(0.5).values.astype(np.float32)
+    trend_fast = pd.Series(fx_mean_ret, index=idx).ewm(span=12, adjust=False).mean().values.astype(np.float32)
+    trend_slow = pd.Series(fx_mean_ret, index=idx).ewm(span=48, adjust=False).mean().values.astype(np.float32)
+    trend_strength = trend_fast - trend_slow
+
+    sp500_ret = np.zeros(len(idx), dtype=np.float32)
+    gold_ret = np.zeros(len(idx), dtype=np.float32)
+    if 'sp500_close' in macro_closes:
+        s = macro_closes['sp500_close']
+        sp500_ret[1:] = np.diff(np.log(s + 1e-8))
+    if 'gold_close' in macro_closes:
+        g = macro_closes['gold_close']
+        gold_ret[1:] = np.diff(np.log(g + 1e-8))
+    risk_proxy = sp500_ret - gold_ret
+
+    shared_series = {
+        'regime_volatility_percentile': vol_q,
+        'regime_high_vol': (vol_q > 0.67).astype(np.float32),
+        'regime_low_vol': (vol_q < 0.33).astype(np.float32),
+        'regime_trend_strength': trend_strength.astype(np.float32),
+        'regime_trending': (np.abs(trend_strength) > (pd.Series(trend_strength, index=idx)
+                            .rolling(96, min_periods=24).std().fillna(0).values)).astype(np.float32),
+        'regime_risk_proxy': risk_proxy.astype(np.float32),
+        'regime_risk_on': (pd.Series(risk_proxy, index=idx).ewm(span=12, adjust=False)
+                           .mean().values > 0).astype(np.float32),
+        'regime_cross_pair_dispersion': fx_dispersion.astype(np.float32),
+    }
+
     node_arrays = []
     matched_counts = []
     for pair in PAIRS:
@@ -458,6 +502,8 @@ def run_daily_cycle():
                 mat[:, ci] = pair_df_ri['Close'].values.astype(np.float32); matched += 1
             elif col in macro_closes:
                 mat[:, ci] = macro_closes[col]; matched += 1
+            elif col in shared_series:
+                mat[:, ci] = shared_series[col]; matched += 1
         node_arrays.append(mat)
         matched_counts.append(matched)
 

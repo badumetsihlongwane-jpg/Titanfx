@@ -18,8 +18,24 @@ from sklearn.preprocessing import LabelEncoder
 
 warnings.filterwarnings("ignore")
 
-BASE = Path(r"c:\Users\55780\Documents\forex projects\TitanDataset")
-OUT  = BASE / "Titan15M_Dataset.csv"
+def _resolve_base_dir() -> Path:
+    # Priority: explicit env var -> common Kaggle paths -> current working directory
+    if os.getenv("TITAN_DATA_BASE"):
+        return Path(os.getenv("TITAN_DATA_BASE")).expanduser().resolve()
+
+    kaggle_candidates = [
+        Path('/kaggle/working'),
+        Path('/kaggle/input/titanfx'),
+        Path('/kaggle/input'),
+    ]
+    for c in kaggle_candidates:
+        if c.exists():
+            return c
+    return Path.cwd()
+
+
+BASE = _resolve_base_dir()
+OUT  = Path(os.getenv("TITAN_OUT_PATH", str(Path('/kaggle/working/Titan15M_Dataset.csv' if Path('/kaggle/working').exists() else BASE / 'Titan15M_Dataset.csv'))))
 EVENT_ENCODER_OUT = BASE / "event_label_encoder_15m.json"
 
 DATE_START = "2024-01-01"
@@ -356,6 +372,46 @@ def stage_5_time(merged):
 
     return merged
 
+
+
+# =============================================================================
+# STAGE 5B - Regime Features (Model-Quality Upgrades)
+# =============================================================================
+def stage_5b_regimes(merged):
+    log("Stage 5B ▸ Adding regime-aware market state features …")
+
+    pair_ret_cols = [f"{p}_ret_1" for p in PAIRS.keys() if f"{p}_ret_1" in merged.columns]
+    if pair_ret_cols:
+        fx_mean_ret = merged[pair_ret_cols].mean(axis=1)
+        fx_dispersion = merged[pair_ret_cols].std(axis=1).fillna(0)
+    else:
+        fx_mean_ret = pd.Series(0.0, index=merged.index)
+        fx_dispersion = pd.Series(0.0, index=merged.index)
+
+    fx_vol_20 = fx_mean_ret.rolling(20, min_periods=5).std().fillna(0)
+    vol_q = fx_vol_20.rolling(20 * 5, min_periods=20).rank(pct=True).fillna(0.5)
+    merged["regime_volatility_percentile"] = vol_q
+    merged["regime_high_vol"] = (vol_q > 0.67).astype(np.int8)
+    merged["regime_low_vol"] = (vol_q < 0.33).astype(np.int8)
+
+    fx_trend_ema_fast = fx_mean_ret.ewm(span=12, adjust=False).mean()
+    fx_trend_ema_slow = fx_mean_ret.ewm(span=48, adjust=False).mean()
+    trend_strength = (fx_trend_ema_fast - fx_trend_ema_slow).fillna(0)
+    merged["regime_trend_strength"] = trend_strength
+    merged["regime_trending"] = (trend_strength.abs() > trend_strength.rolling(96, min_periods=24).std().fillna(0)).astype(np.int8)
+
+    if {"sp500_ret", "gold_ret"}.issubset(merged.columns):
+        risk_proxy = (merged["sp500_ret"] - merged["gold_ret"]).fillna(0)
+    elif "sp500_ret" in merged.columns:
+        risk_proxy = merged["sp500_ret"].fillna(0)
+    else:
+        risk_proxy = pd.Series(0.0, index=merged.index)
+    merged["regime_risk_proxy"] = risk_proxy
+    merged["regime_risk_on"] = (risk_proxy.ewm(span=12, adjust=False).mean() > 0).astype(np.int8)
+
+    merged["regime_cross_pair_dispersion"] = fx_dispersion
+    return merged
+
 # =============================================================================
 # STAGE 6 - Targets & Leakage Processing
 # =============================================================================
@@ -377,12 +433,24 @@ def stage_6_targets(df):
 def main():
     t0 = datetime.now()
     log(f"Starting NEW Titan 15M build at {t0:%Y-%m-%d %H:%M:%S}")
-    
+    log(f"Data base path: {BASE}")
+    log(f"Output path: {OUT}")
+
+    missing = [f"{pair}:{path}" for pair, path in PAIRS.items() if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing required pair CSV files. Set TITAN_DATA_BASE to the folder containing M1 CSVs.\n"
+            + "\n".join(missing)
+        )
+
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+
     merged = stage_1_forex_15m()
     merged = stage_2_cross_pair(merged)
     merged = stage_3_macro(merged)
     merged = stage_4_calendar(merged)
     merged = stage_5_time(merged)
+    merged = stage_5b_regimes(merged)
     merged = stage_6_targets(merged)
 
     merged = merged.loc[DATE_START:DATE_END]
