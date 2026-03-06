@@ -220,6 +220,10 @@ LAMBDA_TURN   = 0.01
 LAMBDA_CVAR   = 0.01
 LAMBDA_GATE   = 1e-4
 LAMBDA_SL     = 1e-4
+LAMBDA_DIR    = 0.05
+DIR_TARGET_SCALE = 3500.0
+OPPORTUNITY_BPS_FLOOR = 0.30
+LAMBDA_OPPORTUNITY = 0.02
 CVAR_Q        = 0.10
 GATE_THRESH   = 0.20
 DIR_THRESH    = 0.01
@@ -488,12 +492,20 @@ class TradingPolicyLoss(nn.Module):
     def __init__(self,
                  lambda_turn=LAMBDA_TURN, lambda_cvar=LAMBDA_CVAR,
                  lambda_gate=LAMBDA_GATE, lambda_sl=LAMBDA_SL,
+                 lambda_dir=LAMBDA_DIR,
+                 lambda_opp=LAMBDA_OPPORTUNITY,
+                 dir_target_scale=DIR_TARGET_SCALE,
+                 opportunity_bps_floor=OPPORTUNITY_BPS_FLOOR,
                  cvar_q=CVAR_Q, gate_thresh=GATE_THRESH, dir_thresh=DIR_THRESH):
         super().__init__()
         self.lambda_turn = lambda_turn
         self.lambda_cvar = lambda_cvar
         self.lambda_gate = lambda_gate
         self.lambda_sl   = lambda_sl
+        self.lambda_dir  = lambda_dir
+        self.lambda_opp  = lambda_opp
+        self.dir_target_scale = dir_target_scale
+        self.opportunity_bps_floor = opportunity_bps_floor
         self.cvar_q      = cvar_q
         self.gate_thresh = gate_thresh
         self.dir_thresh  = dir_thresh
@@ -512,6 +524,7 @@ class TradingPolicyLoss(nn.Module):
         p_long = 0.5 * (direction + 1.0)
         p_short = 1.0 - p_long
         expected_return = p_long * ret_long + p_short * ret_short
+        edge = ret_long - ret_short
 
         # Soft trade activation aligned with eval
         gate_soft = torch.sigmoid(12.0 * (gate - self.gate_thresh))
@@ -545,7 +558,16 @@ class TradingPolicyLoss(nn.Module):
         # SL sanity (no ultra-tight stops)
         sl_pen = self.lambda_sl * (1.0 / (sl_mult + 1e-6)).mean()
 
-        loss = loss_core + cvar_pen + turn_pen + gate_pen + sl_pen
+        # Directional alignment to market edge (prevents collapse to direction≈0)
+        dir_target = torch.tanh(edge.detach() * self.dir_target_scale)
+        dir_pen = self.lambda_dir * F.mse_loss(direction, dir_target)
+
+        # Reward opening trades only where long/short edge is materially different
+        opportunity_bps = edge.detach().abs() * 1e4
+        opportunity = F.relu(opportunity_bps - self.opportunity_bps_floor)
+        opp_bonus = self.lambda_opp * (trade_soft * opportunity).mean()
+
+        loss = loss_core + cvar_pen + turn_pen + gate_pen + sl_pen + dir_pen - opp_bonus
         return loss
 
 
