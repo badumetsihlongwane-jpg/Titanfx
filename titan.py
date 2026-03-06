@@ -218,11 +218,24 @@ BARSPERYEAR     = BARSPERYEAR_30M
 SPREAD_BPS    = 1.0
 LAMBDA_TURN   = 0.01
 LAMBDA_CVAR   = 0.01
-LAMBDA_GATE   = 1e-4
+LAMBDA_GATE   = 2e-4
 LAMBDA_SL     = 1e-4
+LAMBDA_DIR    = 0.01
+DIR_TARGET_SCALE = 600.0
+OPPORTUNITY_BPS_FLOOR = 0.50
+OPPORTUNITY_BPS_CAP = 8.0
+LAMBDA_OPPORTUNITY = 0.002
 CVAR_Q        = 0.10
-GATE_THRESH   = 0.20
-DIR_THRESH    = 0.01
+GATE_THRESH   = 0.30
+DIR_THRESH    = 0.02
+SIZE_THRESH   = 0.015
+TRADE_SCORE_THRESH = 0.015
+TRADE_RATE_TARGET = 0.12
+LAMBDA_TRADE_RATE = 0.02
+MIN_GATE_MEAN = 0.20
+MIN_SIZE_MEAN = 0.08
+MIN_DIR_MEAN  = 0.08
+LAMBDA_ACTIVATION = 0.01
 
 # Dataset search
 try:
@@ -488,15 +501,41 @@ class TradingPolicyLoss(nn.Module):
     def __init__(self,
                  lambda_turn=LAMBDA_TURN, lambda_cvar=LAMBDA_CVAR,
                  lambda_gate=LAMBDA_GATE, lambda_sl=LAMBDA_SL,
-                 cvar_q=CVAR_Q, gate_thresh=GATE_THRESH, dir_thresh=DIR_THRESH):
+                 lambda_dir=LAMBDA_DIR,
+                 lambda_opp=LAMBDA_OPPORTUNITY,
+                 dir_target_scale=DIR_TARGET_SCALE,
+                 opportunity_bps_floor=OPPORTUNITY_BPS_FLOOR,
+                 opportunity_bps_cap=OPPORTUNITY_BPS_CAP,
+                 trade_rate_target=TRADE_RATE_TARGET,
+                 lambda_trade_rate=LAMBDA_TRADE_RATE,
+                 min_gate_mean=MIN_GATE_MEAN,
+                 min_size_mean=MIN_SIZE_MEAN,
+                 min_dir_mean=MIN_DIR_MEAN,
+                 lambda_activation=LAMBDA_ACTIVATION,
+                 cvar_q=CVAR_Q, gate_thresh=GATE_THRESH,
+                 dir_thresh=DIR_THRESH, size_thresh=SIZE_THRESH,
+                 trade_score_thresh=TRADE_SCORE_THRESH):
         super().__init__()
         self.lambda_turn = lambda_turn
         self.lambda_cvar = lambda_cvar
         self.lambda_gate = lambda_gate
         self.lambda_sl   = lambda_sl
+        self.lambda_dir  = lambda_dir
+        self.lambda_opp  = lambda_opp
+        self.dir_target_scale = dir_target_scale
+        self.opportunity_bps_floor = opportunity_bps_floor
+        self.opportunity_bps_cap = opportunity_bps_cap
+        self.trade_rate_target = trade_rate_target
+        self.lambda_trade_rate = lambda_trade_rate
+        self.min_gate_mean = min_gate_mean
+        self.min_size_mean = min_size_mean
+        self.min_dir_mean = min_dir_mean
+        self.lambda_activation = lambda_activation
         self.cvar_q      = cvar_q
         self.gate_thresh = gate_thresh
         self.dir_thresh  = dir_thresh
+        self.size_thresh = size_thresh
+        self.trade_score_thresh = trade_score_thresh
 
     def forward(self, action: Dict[str, torch.Tensor],
                 ret_long: torch.Tensor,
@@ -512,11 +551,13 @@ class TradingPolicyLoss(nn.Module):
         p_long = 0.5 * (direction + 1.0)
         p_short = 1.0 - p_long
         expected_return = p_long * ret_long + p_short * ret_short
+        edge = ret_long - ret_short
 
         # Soft trade activation aligned with eval
         gate_soft = torch.sigmoid(12.0 * (gate - self.gate_thresh))
         dir_soft  = torch.sigmoid(12.0 * (direction.abs() - self.dir_thresh))
-        trade_soft = gate_soft * dir_soft
+        size_soft = torch.sigmoid(18.0 * (size - self.size_thresh))
+        trade_soft = gate_soft * dir_soft * size_soft
 
         pos = trade_soft * size * direction.abs()
 
@@ -545,7 +586,27 @@ class TradingPolicyLoss(nn.Module):
         # SL sanity (no ultra-tight stops)
         sl_pen = self.lambda_sl * (1.0 / (sl_mult + 1e-6)).mean()
 
-        loss = loss_core + cvar_pen + turn_pen + gate_pen + sl_pen
+        # Directional alignment to market edge (prevents collapse to direction≈0)
+        dir_target = torch.tanh(edge.detach() * self.dir_target_scale)
+        dir_pen = self.lambda_dir * F.mse_loss(direction, dir_target)
+
+        # Reward opening trades only where long/short edge is materially different
+        opportunity_bps = edge.detach().abs() * 1e4
+        opportunity = F.relu(opportunity_bps - self.opportunity_bps_floor)
+        opportunity = torch.clamp(opportunity, max=self.opportunity_bps_cap)
+        opp_bonus = self.lambda_opp * (pos * opportunity).mean()
+
+        # Keep participation away from collapse (near 0%) and overtrading (near 100%)
+        trade_rate = trade_soft.mean()
+        trade_rate_pen = self.lambda_trade_rate * (trade_rate - self.trade_rate_target).pow(2)
+
+        # Anti-collapse floor on action magnitudes (prevents all-head dead zone)
+        gate_floor = F.relu(self.min_gate_mean - gate.mean())
+        size_floor = F.relu(self.min_size_mean - size.mean())
+        dir_floor = F.relu(self.min_dir_mean - direction.abs().mean())
+        activation_pen = self.lambda_activation * (gate_floor + size_floor + dir_floor)
+
+        loss = loss_core + cvar_pen + turn_pen + gate_pen + sl_pen + dir_pen + trade_rate_pen + activation_pen - opp_bonus
         return loss
 
 
@@ -762,10 +823,12 @@ def evaluate_v6(model, loader, criterion, device, periods_per_year=BARSPERYEAR_3
             sl_h = is_long * sl_l + is_short * sl_s
             to_h = is_long * to_l + is_short * to_s
 
-            trade_mask = ((act['gate'] > GATE_THRESH) &
-                          (act['direction'].abs() > DIR_THRESH)).float()
+            trade_score = act['gate'] * act['direction'].abs() * act['size']
+            trade_mask = (trade_score > TRADE_SCORE_THRESH).float()
+            exec_weight = trade_mask * trade_score
+            realized_exec = realized * exec_weight
 
-            all_realized.append(realized.cpu().numpy())
+            all_realized.append(realized_exec.cpu().numpy())
             all_mask.append(trade_mask.cpu().numpy())
             all_tp.append(tp_h.cpu().numpy())
             all_sl.append(sl_h.cpu().numpy())
