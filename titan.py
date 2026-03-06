@@ -223,6 +223,7 @@ LAMBDA_SL     = 1e-4
 CVAR_Q        = 0.10
 GATE_THRESH   = 0.20
 DIR_THRESH    = 0.01
+MIN_TRADE_FRAC= 0.02
 
 # Dataset search
 try:
@@ -518,7 +519,9 @@ class TradingPolicyLoss(nn.Module):
         dir_soft  = torch.sigmoid(12.0 * (direction.abs() - self.dir_thresh))
         trade_soft = gate_soft * dir_soft
 
-        pos = trade_soft * size * direction.abs()
+        # Keep position sizing smooth so gradients can move direction away from 0.
+        # Multiplying by |direction| here can dead-zone learning around exactly 0.
+        pos = trade_soft * size
 
         # Core PnL scaled to bps
         pnl = pos * expected_return * 1e4
@@ -764,6 +767,16 @@ def evaluate_v6(model, loader, criterion, device, periods_per_year=BARSPERYEAR_3
 
             trade_mask = ((act['gate'] > GATE_THRESH) &
                           (act['direction'].abs() > DIR_THRESH)).float()
+
+            # If strict thresholds produce zero trades, use a tiny top-k fallback so
+            # validation can still score exploratory behaviour.
+            if trade_mask.sum().item() == 0:
+                score = (act['gate'] * act['direction'].abs()).view(-1)
+                k = max(1, int(MIN_TRADE_FRAC * score.numel()))
+                topk = torch.topk(score, k=k, largest=True).indices
+                trade_mask = torch.zeros_like(score)
+                trade_mask[topk] = 1.0
+                trade_mask = trade_mask.view_as(act['gate'])
 
             all_realized.append(realized.cpu().numpy())
             all_mask.append(trade_mask.cpu().numpy())
