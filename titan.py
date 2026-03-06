@@ -218,7 +218,7 @@ BARSPERYEAR     = BARSPERYEAR_30M
 SPREAD_BPS    = 1.0
 LAMBDA_TURN   = 0.01
 LAMBDA_CVAR   = 0.01
-LAMBDA_GATE   = 5e-4
+LAMBDA_GATE   = 2e-4
 LAMBDA_SL     = 1e-4
 LAMBDA_DIR    = 0.01
 DIR_TARGET_SCALE = 600.0
@@ -226,9 +226,11 @@ OPPORTUNITY_BPS_FLOOR = 0.50
 OPPORTUNITY_BPS_CAP = 8.0
 LAMBDA_OPPORTUNITY = 0.002
 CVAR_Q        = 0.10
-GATE_THRESH   = 0.55
-DIR_THRESH    = 0.08
-SIZE_THRESH   = 0.05
+GATE_THRESH   = 0.35
+DIR_THRESH    = 0.03
+SIZE_THRESH   = 0.02
+TRADE_RATE_TARGET = 0.12
+LAMBDA_TRADE_RATE = 0.02
 
 # Dataset search
 try:
@@ -499,6 +501,8 @@ class TradingPolicyLoss(nn.Module):
                  dir_target_scale=DIR_TARGET_SCALE,
                  opportunity_bps_floor=OPPORTUNITY_BPS_FLOOR,
                  opportunity_bps_cap=OPPORTUNITY_BPS_CAP,
+                 trade_rate_target=TRADE_RATE_TARGET,
+                 lambda_trade_rate=LAMBDA_TRADE_RATE,
                  cvar_q=CVAR_Q, gate_thresh=GATE_THRESH,
                  dir_thresh=DIR_THRESH, size_thresh=SIZE_THRESH):
         super().__init__()
@@ -511,6 +515,8 @@ class TradingPolicyLoss(nn.Module):
         self.dir_target_scale = dir_target_scale
         self.opportunity_bps_floor = opportunity_bps_floor
         self.opportunity_bps_cap = opportunity_bps_cap
+        self.trade_rate_target = trade_rate_target
+        self.lambda_trade_rate = lambda_trade_rate
         self.cvar_q      = cvar_q
         self.gate_thresh = gate_thresh
         self.dir_thresh  = dir_thresh
@@ -575,7 +581,11 @@ class TradingPolicyLoss(nn.Module):
         opportunity = torch.clamp(opportunity, max=self.opportunity_bps_cap)
         opp_bonus = self.lambda_opp * (pos * opportunity).mean()
 
-        loss = loss_core + cvar_pen + turn_pen + gate_pen + sl_pen + dir_pen - opp_bonus
+        # Keep participation away from collapse (near 0%) and overtrading (near 100%)
+        trade_rate = trade_soft.mean()
+        trade_rate_pen = self.lambda_trade_rate * (trade_rate - self.trade_rate_target).pow(2)
+
+        loss = loss_core + cvar_pen + turn_pen + gate_pen + sl_pen + dir_pen + trade_rate_pen - opp_bonus
         return loss
 
 
