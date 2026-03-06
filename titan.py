@@ -218,7 +218,7 @@ BARSPERYEAR     = BARSPERYEAR_30M
 SPREAD_BPS    = 1.0
 LAMBDA_TURN   = 0.01
 LAMBDA_CVAR   = 0.01
-LAMBDA_GATE   = 2e-4
+LAMBDA_GATE   = 1e-4
 LAMBDA_SL     = 1e-4
 LAMBDA_DIR    = 0.01
 DIR_TARGET_SCALE = 600.0
@@ -226,11 +226,11 @@ OPPORTUNITY_BPS_FLOOR = 0.50
 OPPORTUNITY_BPS_CAP = 8.0
 LAMBDA_OPPORTUNITY = 0.002
 CVAR_Q        = 0.10
-GATE_THRESH   = 0.35
-DIR_THRESH    = 0.03
-SIZE_THRESH   = 0.02
-TRADE_RATE_TARGET = 0.12
-LAMBDA_TRADE_RATE = 0.02
+GATE_THRESH   = 0.20
+DIR_THRESH    = 0.01
+SIZE_THRESH   = 0.00
+TRADE_RATE_TARGET = 0.04
+LAMBDA_TRADE_RATE = 0.005
 
 # Dataset search
 try:
@@ -541,7 +541,7 @@ class TradingPolicyLoss(nn.Module):
         # Soft trade activation aligned with eval
         gate_soft = torch.sigmoid(12.0 * (gate - self.gate_thresh))
         dir_soft  = torch.sigmoid(12.0 * (direction.abs() - self.dir_thresh))
-        size_soft = torch.sigmoid(18.0 * (size - self.size_thresh))
+        size_soft = torch.sigmoid(12.0 * (size - self.size_thresh))
         trade_soft = gate_soft * dir_soft * size_soft
 
         pos = trade_soft * size * direction.abs()
@@ -803,8 +803,7 @@ def evaluate_v6(model, loader, criterion, device, periods_per_year=BARSPERYEAR_3
             to_h = is_long * to_l + is_short * to_s
 
             trade_mask = ((act['gate'] > GATE_THRESH) &
-                          (act['direction'].abs() > DIR_THRESH) &
-                          (act['size'] > SIZE_THRESH)).float()
+                          (act['direction'].abs() > DIR_THRESH)).float()
             exec_weight = trade_mask * act['size'] * act['direction'].abs()
             realized_exec = realized * exec_weight
 
