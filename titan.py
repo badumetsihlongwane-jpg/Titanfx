@@ -1,122 +1,35 @@
 """
-TITAN-NL v5.0: Real-PnL, Triple-Barrier SL/TP, Dual-Head Architecture
-======================================================================
-
-ARCHITECTURE:
-1. SelfModifyingDeltaMemory  — stateful delta-memory cell, M threaded across chunks
-2. ContinuumMemoryMLP (CMS)  — multi-frequency MLP hierarchy
-3. MarketRegimeMemory        — regime-aware graph attention
-4. NestedGraphTitanNL v5     — dual-head: direction [-1,1] × gate [0,1]
-5. RealPnLLoss               — cost-aware PnL: spread + CVaR + vol-scaling
-6. TripleBarrier             — realistic SL/TP realized return targets
-7. Online Evolution Engine   — bar-by-bar weight update after live candle close
+TITAN-NL v6.1 — True Trading Policy Architecture
+==================================================
+New in v6.1:
+  • Two-side return simulator (simulate_long_return & simulate_short_return)
+  • Soft trade activation aligned with evaluation gating
+  • PnL explicitly scaled to bps to battle regularization
+  • Drastically reduced penalties, removed hold penalty
+  • Strictly reset recurrent states to prevent overlapping chunk contamination
+  • Metric evaluation strictly on executed trades (TP/SL/TO rates & MDD)
 """
+import os, sys, io, json, pickle, math
+from typing import Optional, Tuple, List, Dict
+from collections import deque
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import RobustScaler
-import math
-import pickle
-import os
-import io, sys
-from typing import Optional, Tuple, List
-from titan_core.feature_contract import save_feature_schema
 
 try:
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 except Exception:
     pass
 
-# ==========================================
-# 1. CONFIGURATION
-# ==========================================
-CHUNK_LEN   = 16         # Bars per TBPTT chunk
-PAIRS       = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD']
-NUM_NODES   = len(PAIRS)
-D_MODEL     = 96         # Scaled up from 64 for 2-year dataset (~450K params)
-EPOCHS      = 50         # More epochs for larger dataset (was 30)
-PATIENCE    = 12         # Wider patience (was 8) for steady convergence
-LR          = 2e-4       # Slightly lower LR for stability over full year
-NOISE_STD   = 0.01       # Lighter noise on larger, more diverse dataset
-ONLINE_LR   = 5e-6
 
-# ── Date ranges — Titan30M_Dataset.csv (Feb 2025 – Feb 2026) ─────────────────
-# Dataset: Titan30M_Dataset.csv  |  12,356 rows  |  2025-02-26 -> 2026-02-25
-# Split: Train 8mo / Val 2mo / Calib 1mo / Backtest 1mo
-TRAIN_START = "2025-02-26"
-TRAIN_END   = "2025-10-31"   # ~8 months training
-VAL_START   = "2025-11-01"
-VAL_END     = "2025-12-31"   # 2 months val
+# ── Architecture (inlined — fully self-contained, no titan.py needed) ─────────
 
-CALIB_START    = "2026-01-01"
-CALIB_END      = "2026-01-31"
-BACKTEST_START = "2026-02-01"
-BACKTEST_END   = "2026-02-25"   # exact period we failed on before
-CALIB_DAYS     = 30
-
-# ── Bar timing (set to match your dataset) ───────────────────────────────────
-BARSPERYEAR_15M = 22176    # 15m bars per trading year
-BARSPERYEAR_30M = 11088    # 30m bars per trading year
-
-# Change this to '30m' once you have Titan30M_Dataset.csv
-DATASET_INTERVAL  = '30m'  # '15m' or '30m'
-BARSPERYEAR       = BARSPERYEAR_30M if DATASET_INTERVAL == '30m' else BARSPERYEAR_15M
-
-CMS_CHUNK_SIZES  = [16, 64, 256]
-
-# ── Real PnL Loss hyperparams ─────────────────────────────────────────────────
-SPREAD_BPS   = 1.0       # Round-trip spread cost in bps per trade
-LAMBDA_TC    = 0.5       # Turnover penalty weight
-LAMBDA_CVAR  = 0.1       # CVaR tail-risk penalty weight
-TARGET_VOL   = 0.001     # Target per-pair volatility (~10 bps / 15m bar)
-CVAR_QUANTILE = 0.10     # Penalise worst-10% PnL outcomes
-
-# ── Triple-Barrier SL/TP hyperparams ─────────────────────────────────────────
-ATR_PERIOD   = 14        # Bars for ATR rolling window
-K_TP         = 2.0       # TP multiple of ATR
-K_SL         = 1.5       # SL multiple of ATR
-# MAX_HOLD in bars: 6×30m = 3h horizon (same wall-clock as 12×15m)
-MAX_HOLD     = 6  if DATASET_INTERVAL == '30m' else 12
-
-try:
-    _here = os.path.dirname(os.path.abspath(__file__))
-    # Try 30m dataset first, fall back to 15m
-    for _fname in ('Titan30M_Dataset.csv', 'Titan15M_Dataset.csv',
-                   'TitanForexDataset.csv', 'Titan_Dataset.csv'):
-        _candidate = os.path.join(_here, _fname)
-        if os.path.exists(_candidate):
-            DATASET_PATH = _candidate
-            break
-    else:
-        DATASET_PATH = os.path.join(_here, 'Titan30M_Dataset.csv')  # will trigger auto-search
-except NameError:
-    # Kaggle / notebook: try both known paths
-    for _kpath in ('/kaggle/input/datasets/zackhlongwane/titanv2/Titan30M_Dataset.csv',
-                   '/kaggle/input/datasets/zackhlongwane/titanv2/Titan15M_Dataset.csv',
-                   '/kaggle/input/titanfx/Titan30M_Dataset.csv',
-                   '/kaggle/input/titanfx/TitanForexDataset.csv',
-                   '/kaggle/input/titanfx/Titan15M_Dataset.csv',
-                   '/kaggle/input/datasets/zackhlongwane/fxtitan/TitanForexDataset.csv'):
-        if os.path.exists(_kpath):
-            DATASET_PATH = _kpath
-            break
-    else:
-        DATASET_PATH = '/kaggle/input/titanfx/Titan30M_Dataset.csv'
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-print(f"TITAN-NL v5.0: Real-PnL | Triple-Barrier SL/TP | Dual-Head Architecture")
-print(f"Device: {DEVICE}")
-
-
-# ==========================================
-# 2. M3 OPTIMIZER (Multi-scale Momentum Muon)
-# ==========================================
 class M3Optimizer(optim.Optimizer):
     def __init__(self, params, lr=3e-4, betas=(0.9, 0.95, 0.999), eps=1e-8,
                  weight_decay=1e-2, ns_steps=5, slow_momentum_freq=10, alpha_slow=0.1):
@@ -127,16 +40,13 @@ class M3Optimizer(optim.Optimizer):
 
     @staticmethod
     def newton_schulz(M: torch.Tensor, steps: int = 5) -> torch.Tensor:
-        if M.dim() != 2 or M.shape[0] > M.shape[1]:
-            return M
+        if M.dim() != 2 or M.shape[0] > M.shape[1]: return M
         norm = M.norm()
-        if norm < 1e-8:
-            return M
+        if norm < 1e-8: return M
         X = M / max(norm.item(), 1e-6)
         for _ in range(steps):
             A = X @ X.T
-            if A.norm().item() > 1e4:
-                return M
+            if A.norm().item() > 1e4: return M
             X = 1.5 * X - 0.5 * A @ X
         return X * norm
 
@@ -144,14 +54,12 @@ class M3Optimizer(optim.Optimizer):
     def step(self, closure=None):
         loss = None
         if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+            with torch.enable_grad(): loss = closure()
         self.step_count += 1
         for group in self.param_groups:
             beta1_fast, beta1_slow, beta2 = group['betas']
             for p in group['params']:
-                if p.grad is None:
-                    continue
+                if p.grad is None: continue
                 grad = p.grad
                 if group['weight_decay'] != 0:
                     p.data.mul_(1 - group['lr'] * group['weight_decay'])
@@ -164,993 +72,933 @@ class M3Optimizer(optim.Optimizer):
                     state['grad_running_avg'] = torch.zeros_like(p)
                     state['grad_count'] = 0
                 state['step'] += 1
-                m1_fast = state['m1_fast']
-                m1_slow = state['m1_slow']
-                v = state['v']
+                m1_fast, m1_slow, v = state['m1_fast'], state['m1_slow'], state['v']
                 m1_fast.mul_(beta1_fast).add_(grad, alpha=1 - beta1_fast)
                 v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
                 state['grad_count'] += 1
-                count = state['grad_count']
-                state['grad_running_avg'].mul_((count - 1) / count).add_(grad, alpha=1.0 / count)
+                cnt = state['grad_count']
+                state['grad_running_avg'].mul_((cnt-1)/cnt).add_(grad, alpha=1./cnt)
                 if self.step_count % group['slow_momentum_freq'] == 0:
-                    m1_slow.mul_(beta1_slow).add_(state['grad_running_avg'], alpha=1 - beta1_slow)
-                    state['grad_running_avg'].zero_()
-                    state['grad_count'] = 0
-                bias_c1 = 1 - beta1_fast ** state['step']
-                bias_c2 = 1 - beta2 ** state['step']
-                m1_fast_c = m1_fast / bias_c1
-                v_corrected = v / bias_c2
-                if m1_fast_c.dim() == 2 and min(m1_fast_c.shape) > 1:
-                    m1_orth = self.newton_schulz(m1_fast_c, group['ns_steps'])
-                    m1_slow_orth = self.newton_schulz(m1_slow, group['ns_steps'])
-                else:
-                    m1_orth = m1_fast_c
-                    m1_slow_orth = m1_slow
-                combined = m1_orth + group['alpha_slow'] * m1_slow_orth
-                denom = v_corrected.sqrt().add_(group['eps'])
-                p.data.addcdiv_(combined, denom, value=-group['lr'])
+                    m1_slow.mul_(beta1_slow).add_(state['grad_running_avg'], alpha=1-beta1_slow)
+                    state['grad_running_avg'].zero_(); state['grad_count'] = 0
+                bc1 = 1 - beta1_fast**state['step']; bc2 = 1 - beta2**state['step']
+                m1c = m1_fast / bc1; vc = v / bc2
+                m1o = self.newton_schulz(m1c, group['ns_steps']) if (m1c.dim()==2 and min(m1c.shape)>1) else m1c
+                m1so= self.newton_schulz(m1_slow, group['ns_steps']) if (m1_slow.dim()==2 and min(m1_slow.shape)>1) else m1_slow
+                combined = m1o + group['alpha_slow']*m1so
+                p.data.addcdiv_(combined, vc.sqrt().add_(group['eps']), value=-group['lr'])
         return loss
 
 
-# ==========================================
-# 3. SELF-MODIFYING DELTA MEMORY (Stateful)
-# ==========================================
 class SelfModifyingDeltaMemory(nn.Module):
-    """
-    Delta Gradient Descent memory cell.
-    BUG FIX: accepts prev_M from outside; returns updated M so it can be
-    threaded across sequential chunks — this is what makes evolution real.
-    """
-
     def __init__(self, d_model: int, dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
         self.proj_q  = nn.Linear(d_model, d_model, bias=False)
         self.proj_k  = nn.Linear(d_model, d_model, bias=False)
         self.proj_v  = nn.Linear(d_model, d_model, bias=False)
-        self.value_generator = nn.Sequential(
-            nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
-        )
-        self.eta_proj = nn.Sequential(
-            nn.Linear(d_model, d_model // 4), nn.SiLU(), nn.Linear(d_model // 4, 1), nn.Sigmoid()
-        )
-        self.alpha_proj = nn.Sequential(
-            nn.Linear(d_model, d_model // 4), nn.SiLU(), nn.Linear(d_model // 4, 1), nn.Sigmoid()
-        )
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.norm     = nn.LayerNorm(d_model)
-        self.dropout  = nn.Dropout(dropout)
+        self.value_generator = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
+        self.eta_proj  = nn.Sequential(nn.Linear(d_model, d_model//4), nn.SiLU(), nn.Linear(d_model//4, 1), nn.Sigmoid())
+        self.alpha_proj= nn.Sequential(nn.Linear(d_model, d_model//4), nn.SiLU(), nn.Linear(d_model//4, 1), nn.Sigmoid())
+        self.out_proj  = nn.Linear(d_model, d_model)
+        self.norm      = nn.LayerNorm(d_model)
+        self.dropout   = nn.Dropout(dropout)
         self.register_buffer('init_memory', torch.zeros(d_model, d_model))
 
-    def forward(
-        self,
-        x: torch.Tensor,                       # [B, S, N, D]
-        prev_M: Optional[torch.Tensor] = None  # [B*N, D, D] — persistent carry-over
-    ) -> Tuple[torch.Tensor, torch.Tensor]:    # output [B,S,N,D], M [B*N,D,D]
-
+    def forward(self, x: torch.Tensor, prev_M=None):
         b, s, n, f = x.shape
-        x_flat = x.view(b * n, s, f)
-        residual = x_flat
-
-        q     = self.proj_q(x_flat)          # [B*N, S, D]
-        k     = self.proj_k(x_flat)
-        v     = self.proj_v(x_flat)
+        x_flat = x.view(b*n, s, f); residual = x_flat
+        q = self.proj_q(x_flat); k = self.proj_k(x_flat); v = self.proj_v(x_flat)
         v_hat = self.value_generator(v)
-        eta   = self.eta_proj(x_flat)   * 0.1 + 0.01   # [B*N, S, 1]
-        alpha = self.alpha_proj(x_flat) * 0.5 + 0.5    # [B*N, S, 1]
-
-        # ── Seed from external state if provided, else start fresh ──────
-        if prev_M is not None:
-            M = prev_M
-        else:
-            M = self.init_memory.unsqueeze(0).expand(b * n, -1, -1).clone()
-
-        outputs = []
+        eta   = self.eta_proj(x_flat)  * 0.1 + 0.01
+        alpha = self.alpha_proj(x_flat)* 0.5 + 0.5
+        M = prev_M if prev_M is not None else self.init_memory.unsqueeze(0).expand(b*n,-1,-1).clone()
+        outputs =[]
         for t in range(s):
-            q_t      = q[:, t, :]
-            k_t_norm = F.normalize(k[:, t, :], dim=-1)
-            v_t      = v_hat[:, t, :]
-            eta_t    = eta[:, t, :].unsqueeze(-1)    # [B*N, 1, 1]
-            alpha_t  = alpha[:, t, :].unsqueeze(-1)  # [B*N, 1, 1]
-
-            # Read
+            q_t = q[:,t,:]; k_t = F.normalize(k[:,t,:], dim=-1); v_t = v_hat[:,t,:]
+            eta_t = eta[:,t,:].unsqueeze(-1); alpha_t = alpha[:,t,:].unsqueeze(-1)
             out_t = torch.bmm(M, q_t.unsqueeze(-1)).squeeze(-1)
-
-            # Delta rule write: M_t = alpha*M - eta*M*kk^T + eta*v_hat*k^T
-            Mk = torch.bmm(M, k_t_norm.unsqueeze(-1))  # [B*N, D, 1]
-            M  = (alpha_t * M
-                  - eta_t * torch.bmm(Mk, k_t_norm.unsqueeze(-2))
-                  + eta_t * torch.bmm(v_t.unsqueeze(-1), k_t_norm.unsqueeze(-2)))
+            Mk = torch.bmm(M, k_t.unsqueeze(-1))
+            M  = alpha_t*M - eta_t*torch.bmm(Mk, k_t.unsqueeze(-2)) + eta_t*torch.bmm(v_t.unsqueeze(-1), k_t.unsqueeze(-2))
             outputs.append(out_t)
-
-        output = torch.stack(outputs, dim=1)   # [B*N, S, D]
+        output = torch.stack(outputs, dim=1)
         output = self.norm(self.dropout(self.out_proj(output)) + residual)
-        return output.view(b, s, n, f), M       # ← return final M for next chunk
+        return output.view(b, s, n, f), M
 
 
-# ==========================================
-# 4. CONTINUUM MEMORY SYSTEM (CMS) — FIXED
-# ==========================================
 class ContinuumMemoryMLP(nn.Module):
-    """
-    Multi-frequency MLP hierarchy.
-    BUG FIX v4.1: removed stray `M` return — CMS is stateless in terms of a
-    matrix. Its 'memory' lives entirely in its learned weights across chunks.
-    Returns only the processed tensor.
-    """
-
     def __init__(self, d_model: int, chunk_sizes: List[int] = [16, 64, 256],
                  expansion: int = 4, dropout: float = 0.1):
         super().__init__()
         self.chunk_sizes = chunk_sizes
         self.num_levels  = len(chunk_sizes)
         self.mlps = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d_model, d_model * expansion),
-                nn.SiLU(),
-                nn.Dropout(dropout),
-                nn.Linear(d_model * expansion, d_model),
-                nn.Dropout(dropout)
-            ) for _ in range(self.num_levels)
-        ])
+            nn.Sequential(nn.Linear(d_model, d_model*expansion), nn.SiLU(),
+                          nn.Dropout(dropout), nn.Linear(d_model*expansion, d_model), nn.Dropout(dropout))
+            for _ in range(self.num_levels)])
         self.level_weights = nn.Parameter(torch.ones(self.num_levels))
         self.level_norms   = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(self.num_levels)])
         self.final_norm    = nn.LayerNorm(d_model)
 
-    def forward(self, x: torch.Tensor, step: int = 0) -> torch.Tensor:   # [B,S,N,D] → [B,S,N,D]
+    def forward(self, x: torch.Tensor, step: int = 0) -> torch.Tensor:
         b, s, n, f = x.shape
-        x_flat = x.view(b * s * n, f)
-        level_outputs = []
-        for level_idx, (mlp, norm) in enumerate(zip(self.mlps, self.level_norms)):
+        x_flat = x.view(b*s*n, f)
+        level_outputs =[]
+        for li, (mlp, norm) in enumerate(zip(self.mlps, self.level_norms)):
             out = mlp(x_flat)
-            # Stochastic depth during training: lower freqs drop less
             if self.training:
-                drop_p = [0.3, 0.15, 0.0][level_idx]
+                drop_p = 0.3*(1 - li/max(self.num_levels-1, 1))
                 out = F.dropout(out, p=drop_p, training=True)
             level_outputs.append(norm(out + x_flat))
-        weights    = F.softmax(self.level_weights, dim=0)
-        aggregated = sum(w * o for w, o in zip(weights, level_outputs))
-        return self.final_norm(aggregated).view(b, s, n, f)   # ← no M here
+        weights = F.softmax(self.level_weights, dim=0)
+        agg = sum(w*o for w, o in zip(weights, level_outputs))
+        return self.final_norm(agg).view(b, s, n, f)
 
 
-# ==========================================
-# 5. MARKET REGIME ADAPTIVE MEMORY
-# ==========================================
 class MarketRegimeMemory(nn.Module):
-    """
-    Regime-aware graph attention that collapses the temporal dim.
-    Returns [B, N, D] summary for prediction head.
-    """
-
     def __init__(self, num_nodes: int, d_model: int, dropout: float = 0.2):
         super().__init__()
-        self.num_nodes = num_nodes
-        self.d_model   = d_model
-        self.regime_detector = nn.Sequential(
-            nn.Linear(d_model * 2, d_model), nn.SiLU(),
-            nn.Linear(d_model, 3), nn.Softmax(dim=-1)
-        )
+        self.num_nodes = num_nodes; self.d_model = d_model
+        self.regime_detector = nn.Sequential(nn.Linear(d_model*2, d_model), nn.SiLU(), nn.Linear(d_model, 3), nn.Softmax(dim=-1))
         self.regime_eta   = nn.Parameter(torch.tensor([0.1, 0.05, 0.2]))
         self.regime_alpha = nn.Parameter(torch.tensor([0.8, 0.9, 0.6]))
-        self.q_graph      = nn.Linear(d_model, d_model)
-        self.k_graph      = nn.Linear(d_model, d_model)
-        self.v_graph      = nn.Linear(d_model, d_model)
-        self.gate_net     = nn.Sequential(
-            nn.LayerNorm(d_model * 3 + 3),
-            nn.Linear(d_model * 3 + 3, 64), nn.ReLU(),
-            nn.Linear(64, 1)
-        )
+        self.q_graph = nn.Linear(d_model, d_model)
+        self.k_graph = nn.Linear(d_model, d_model)
+        self.v_graph = nn.Linear(d_model, d_model)
+        self.gate_net = nn.Sequential(nn.LayerNorm(d_model*3+3), nn.Linear(d_model*3+3, 64), nn.ReLU(), nn.Linear(64, 1))
         nn.init.constant_(self.gate_net[-1].bias, 1.5)
         self.gate_act = nn.Sigmoid()
         self.norm     = nn.LayerNorm(d_model)
         self.dropout  = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Summarise last few timesteps as 'state'
-        state    = x[:, -3:, :, :].mean(dim=1)  # [B, N, D]
-        b, n, d  = state.shape
-        residual = state
-
-        global_mean = state.mean(dim=1, keepdim=True)
-        global_std  = state.std(dim=1, keepdim=True)
-
-        regime_input = torch.cat([state, global_mean.expand(-1, n, -1)], dim=-1)
-        regime_probs = self.regime_detector(regime_input)  # [B, N, 3]
-
-        gate_input   = torch.cat([state, global_mean.expand(-1, n, -1),
-                                  global_std.expand(-1, n, -1), regime_probs], dim=-1)
-        alpha        = self.gate_act(self.gate_net(gate_input))  # [B, N, 1]
-
-        Q = self.q_graph(state)
-        K = self.k_graph(state)
-        V = self.v_graph(state)
-
-        attn_scores  = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d)
-        attn_weights = F.softmax(attn_scores, dim=-1)
-
-        I            = torch.eye(n, device=x.device).unsqueeze(0).expand(b, -1, -1)
-        mixed_weights = (alpha * I) + ((1 - alpha) * attn_weights)
-
-        out = self.norm(self.dropout(torch.matmul(mixed_weights, V)) + residual)
-        return out, alpha, attn_weights, regime_probs
+    def forward(self, x: torch.Tensor):
+        state = x[:, -3:, :, :].mean(dim=1)   # [B, N, D]
+        b, n, d = state.shape; residual = state
+        gmean = state.mean(dim=1, keepdim=True); gstd = state.std(dim=1, keepdim=True)
+        regime_probs = self.regime_detector(torch.cat([state, gmean.expand(-1,n,-1)], dim=-1))
+        gate_input   = torch.cat([state, gmean.expand(-1,n,-1), gstd.expand(-1,n,-1), regime_probs], dim=-1)
+        alpha = self.gate_act(self.gate_net(gate_input))
+        Q = self.q_graph(state); K = self.k_graph(state); V = self.v_graph(state)
+        attn = F.softmax(torch.matmul(Q, K.transpose(-2,-1)) / math.sqrt(d), dim=-1)
+        I = torch.eye(n, device=x.device).unsqueeze(0).expand(b,-1,-1)
+        mixed = alpha*I + (1-alpha)*attn
+        out = self.norm(self.dropout(torch.matmul(mixed, V)) + residual)
+        return out, alpha, attn, regime_probs
 
 
-# ==========================================
-# 6. NESTED GRAPH TITAN-NL v5 — DUAL-HEAD
-# ==========================================
-class NestedGraphTitanNL(nn.Module):
-    """
-    v5.0: Dual-head output:
-      • direction_head  → tanh → [-1, 1]   (long / short strength)
-      • gate_head       → sigmoid → [0, 1] (trade confidence / "do nothing" gate)
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+PAIRS           =['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD']
+NUM_NODES       = len(PAIRS)
+CHUNK_LEN       = 16          # context window
+MAX_HOLD_CAP    = 24          # max hold bars (24 × 30m = 12 h)
+D_MODEL         = 128
+NUM_LAYERS      = 3
+CMS_CHUNK_SIZES = [16, 64, 256, 1024]
+EPOCHS          = 75
+PATIENCE        = 15
+LR              = 1.5e-4
+NOISE_STD       = 0.01
+ONLINE_LR       = 5e-6
+EXPLORATION_ONLY= True
 
-    Effective signal = direction * gate.
-    Gate ≈ 0 means flat — the model learns to skip low-conviction bars.
-    Output shape is unchanged: [B, N, 1], compatible with all downstream code.
-    """
+# Date splits
+TRAIN_START     = "2025-03-05"; TRAIN_END   = "2025-10-31"
+VAL_START       = "2025-11-01"; VAL_END     = "2025-12-31"
+CALIB_START     = "2026-01-01"; CALIB_END   = "2026-01-31"
+BACKTEST_START  = "2026-02-01"; BACKTEST_END= "2026-03-04"
 
-    def __init__(self, num_nodes: int = NUM_NODES, feats_per_node: int = 34,
-                 d_model: int = D_MODEL, num_layers: int = 2, dropout: float = 0.3,
-                 cms_chunk_sizes: List[int] = CMS_CHUNK_SIZES):
+BARSPERYEAR_30M = 11088
+BARSPERYEAR_15M = 22176
+DATASET_INTERVAL= '30m'
+BARSPERYEAR     = BARSPERYEAR_30M
+
+# Loss weights (drastically reduced penalties)
+SPREAD_BPS    = 1.0
+LAMBDA_TURN   = 0.01
+LAMBDA_CVAR   = 0.01
+LAMBDA_GATE   = 1e-4
+LAMBDA_SL     = 1e-4
+CVAR_Q        = 0.10
+GATE_THRESH   = 0.20
+DIR_THRESH    = 0.01
+
+# Dataset search
+try:
+    _here = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _here = os.getcwd()
+
+DATASET_PATH = None
+for _f in ('Titan30M_Dataset.csv', 'Titan15M_Dataset.csv', 'TitanForexDataset.csv'):
+    for _d in[_here,
+               '/kaggle/input/datasets/zackhlongwane/newawdat',
+               '/kaggle/input/titanfx']:
+        _p = os.path.join(_d, _f)
+        if os.path.exists(_p):
+            DATASET_PATH = _p
+            break
+    if DATASET_PATH:
+        break
+if not DATASET_PATH:
+    DATASET_PATH = os.path.join(_here, 'Titan30M_Dataset.csv')
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"TITAN-NL v6.1: Policy Architecture | Device: {DEVICE}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. MODEL — 6-HEAD POLICY
+# ══════════════════════════════════════════════════════════════════════════════
+class NestedGraphTitanV6(nn.Module):
+    def __init__(self, num_nodes=NUM_NODES, feats_per_node=23,
+                 d_model=D_MODEL, num_layers=NUM_LAYERS,
+                 dropout=0.3, cms_chunk_sizes=CMS_CHUNK_SIZES):
         super().__init__()
-        mid_dim = min(d_model, max(64, feats_per_node // 3))
-        self.embedding  = nn.Sequential(nn.Linear(feats_per_node, mid_dim), nn.SiLU(),
-                                        nn.Linear(mid_dim, d_model))
-        self.input_norm = nn.LayerNorm(d_model)
+        self.num_nodes = num_nodes
+        self.d_model   = d_model
 
-        # Sinusoidal positional encoding
-        max_len  = 512
-        pos_emb  = torch.zeros(1, max_len, d_model)
-        position = torch.arange(0, max_len).unsqueeze(1).float()
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model))
-        pos_emb[0, :, 0::2] = torch.sin(position * div_term)
-        pos_emb[0, :, 1::2] = torch.cos(position * div_term)
-        self.pos_emb = nn.Parameter(pos_emb)
+        self.input_proj = nn.Sequential(
+            nn.Linear(feats_per_node, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+        self.pos_enc = nn.Parameter(torch.randn(1, CHUNK_LEN * 4, 1, d_model) * 0.02)
 
-        # Stateful temporal layers
         self.temporal_layers = nn.ModuleList([
             SelfModifyingDeltaMemory(d_model, dropout) for _ in range(num_layers)
         ])
-        self.cms           = ContinuumMemoryMLP(d_model, cms_chunk_sizes, expansion=3, dropout=dropout)
-        self.regime_memory = MarketRegimeMemory(num_nodes, d_model, dropout)
+        self.cms = ContinuumMemoryMLP(d_model, cms_chunk_sizes, dropout=dropout)
+        self.regime = MarketRegimeMemory(num_nodes, d_model, dropout=dropout)
 
-        # Shared trunk for both heads
         self.trunk = nn.Sequential(
-            nn.Linear(d_model, d_model // 2), nn.GELU(), nn.Dropout(dropout)
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
 
-        # Head 1: direction signal  [-1, 1]
-        self.direction_head = nn.Sequential(
-            nn.Linear(d_model // 2, 1), nn.Tanh()
-        )
-        # Head 2: trade gate / confidence  [0, 1]
-        # Bias init > 0 so gate starts slightly open, preventing dead-gate at step 0
-        self.gate_head = nn.Sequential(
-            nn.Linear(d_model // 2, 1), nn.Sigmoid()
-        )
-        nn.init.constant_(self.gate_head[0].bias, 0.5)
+        h = d_model // 2
 
-        self._init_weights()
+        def _head(out=1, hidden=None):
+            hid = hidden or h // 2
+            return nn.Sequential(nn.Linear(h, hid), nn.GELU(), nn.Linear(hid, out))
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        # Re-apply gate bias after global zero-init
-        nn.init.constant_(self.gate_head[0].bias, 0.5)
+        self.direction_head = _head()   # → tanh →[-1, 1]
+        self.gate_head      = _head()   # → sigmoid → [0, 1]
+        self.size_head      = _head()   # → sigmoid → [0, 1]
+        self.tp_head        = _head()   # → 0.5 + 5.5·sigmoid → [0.5, 6.0] ATR
+        self.sl_head        = _head()   # → 0.3 + 2.7·sigmoid →[0.3, 3.0] ATR
+        self.hold_head      = _head()   # → 2 + 22·sigmoid → [2, 24] bars
 
-    def forward(
-        self,
-        x: torch.Tensor,            # [B, S, N, F]
-        prev_states=None,           # Optional[List[Tensor]]
-        return_attn: bool = False,
-        step: int = 0
-    ):
-        """
-        Returns
-        -------
-        signal         : [B, N, 1]  gated signal = direction * gate
-        current_states : list of M tensors (one per delta-memory layer)
-        """
-        b, s, n, f = x.shape
-        x   = self.embedding(x)                                   # [B, S, N, D]
-        pos = self.pos_emb[:, :s, :].unsqueeze(2).expand(b, s, n, -1)
-        x   = self.input_norm(x + pos)
+        self._init_heads()
 
-        # Thread state through each delta-memory layer
-        current_states = []
-        for i, layer in enumerate(self.temporal_layers):
-            p_M      = prev_states[i] if prev_states is not None else None
+    def _init_heads(self):
+        nn.init.zeros_(self.direction_head[-1].bias)
+        nn.init.constant_(self.gate_head[-1].bias, 0.5)
+        nn.init.zeros_(self.size_head[-1].bias)
+        nn.init.constant_(self.tp_head[-1].bias, 0.0)
+        nn.init.constant_(self.sl_head[-1].bias, -0.5)
+        nn.init.constant_(self.hold_head[-1].bias, -1.0)
+
+    def forward(self, x, prev_states=None, step=0):
+        B, S, N, F_in = x.shape
+        x = self.input_proj(x)
+        x = x + self.pos_enc[:, :S, :, :]
+
+        if prev_states is None:
+            prev_states = [None] * len(self.temporal_layers)
+        new_states =[]
+        for layer, p_M in zip(self.temporal_layers, prev_states):
             x, new_M = layer(x, p_M)
-            current_states.append(new_M)
+            new_states.append(new_M)
 
-        x = self.cms(x, step=step)                                # [B, S, N, D]
+        x = self.cms(x, step)
+        graph_out, alpha, attn_w, _ = self.regime(x)
 
-        graph_out, alpha, attn_weights, regime_probs = self.regime_memory(x)
-        # graph_out: [B, N, D]
+        last_t   = x[:, -1, :, :]
+        combined = last_t + graph_out
+        trunk    = self.trunk(combined)
 
-        trunk     = self.trunk(graph_out)                         # [B, N, D//2]
-        direction = self.direction_head(trunk)                    # [B, N, 1]
-        gate      = self.gate_head(trunk)                         # [B, N, 1]
-        signal    = direction * gate                              # [B, N, 1]  effective position
+        direction = torch.tanh(self.direction_head(trunk)).squeeze(-1)
+        gate      = torch.sigmoid(self.gate_head(trunk)).squeeze(-1)
+        size      = torch.sigmoid(self.size_head(trunk)).squeeze(-1)
+        tp_mult   = 0.5 + 5.5 * torch.sigmoid(self.tp_head(trunk)).squeeze(-1)
+        sl_mult   = 0.3 + 2.7 * torch.sigmoid(self.sl_head(trunk)).squeeze(-1)
+        hold_soft = 2.0 + 22.0 * torch.sigmoid(self.hold_head(trunk)).squeeze(-1)
 
-        if return_attn:
-            return signal, current_states, attn_weights, alpha, gate
-        return signal, current_states
+        return {
+            'direction': direction,
+            'gate':      gate,
+            'size':      size,
+            'tp_mult':   tp_mult,
+            'sl_mult':   sl_mult,
+            'hold_bars': hold_soft,
+            'states':    new_states,
+        }
 
 
-# ==========================================
-# 7. REAL PnL LOSS  (v5.0)
-# ==========================================
-class RealPnLLoss(nn.Module):
-    """
-    Cost-aware PnL loss combining:
-      1. Core PnL on vol-scaled positions      — -mean(pos * realized_return)
-      2. Transaction-cost / turnover penalty   — λ_tc  * mean(|Δpos|) * spread
-      3. CVaR tail-risk penalty               — λ_cvar * CVaR_q(per-bar pnl)
-      4. L2 regulariser on raw direction head  — λ_l2  * mean(dir²)
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. TRADE SIMULATORS (Two-Side Returns)
+# ══════════════════════════════════════════════════════════════════════════════
+def simulate_long_return(
+    tp_mult:      torch.Tensor,   # [B, N]
+    sl_mult:      torch.Tensor,   # [B, N]
+    hold_bars:    torch.Tensor,   # [B, N]
+    entry_close:  torch.Tensor,   #[B, N]
+    entry_atr:    torch.Tensor,   # [B, N]
+    future_high:  torch.Tensor,   # [B, H, N]
+    future_low:   torch.Tensor,   # [B, H, N]
+    future_close: torch.Tensor,   # [B, H, N]
+    spread_cost:  float = 0.0001,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, H, N = future_high.shape
+    dev = entry_close.device
 
-    Vol-scaling:  pos = dir * gate * (TARGET_VOL / realized_vol).clamp(0.1, 3.0)
-    This makes EURUSD and USDJPY contribute equal risk per unit signal.
+    entry = entry_close
+    atr   = entry_atr.clamp(min=1e-8)
 
-    Triple-barrier targets (pre-computed in load_titan_dataset) replace
-    raw log-returns so the model trains on realistic trade outcomes.
-    """
-    def __init__(
-        self,
-        spread_bps:     float = SPREAD_BPS,
-        lambda_tc:      float = LAMBDA_TC,
-        lambda_cvar:    float = LAMBDA_CVAR,
-        target_vol:     float = TARGET_VOL,
-        cvar_quantile:  float = CVAR_QUANTILE,
-        lambda_l2:      float = 0.02,
-    ):
+    tp_price = entry + tp_mult * atr
+    sl_price = entry - sl_mult * atr
+
+    hold_int = hold_bars.detach().round().long().clamp(1, H)
+
+    tp_e = tp_price.unsqueeze(1).expand(B, H, N)
+    sl_e = sl_price.unsqueeze(1).expand(B, H, N)
+    fh, fl = future_high, future_low
+
+    tp_hit_mask = fh >= tp_e
+    sl_hit_mask = fl <= sl_e
+
+    tp_only_mask = tp_hit_mask & ~sl_hit_mask
+
+    bar_idx  = torch.arange(H, device=dev).view(1, H, 1).expand(B, H, N)
+    hold_e   = hold_int.unsqueeze(1).expand(B, H, N)
+    in_hold  = bar_idx < hold_e
+
+    tp_valid = tp_only_mask & in_hold
+    sl_valid = sl_hit_mask  & in_hold
+
+    INF = H
+    def _first(mask):
+        has  = mask.any(dim=1)
+        idx  = mask.float().argmax(dim=1)
+        return torch.where(has, idx, torch.full_like(idx, INF))
+
+    first_tp = _first(tp_valid)
+    first_sl = _first(sl_valid)
+
+    has_tp = (first_tp < INF)
+    has_sl = (first_sl < INF)
+
+    tp_wins  = has_tp & (~has_sl | (first_tp < first_sl))
+    sl_wins  = has_sl & ~tp_wins
+    timed_out= ~tp_wins & ~sl_wins
+
+    ret_tp  = tp_mult * atr / (entry + 1e-8)
+    ret_sl  = -sl_mult * atr / (entry + 1e-8)
+
+    hold_last = (hold_int - 1).clamp(0, H - 1)
+    fc_gather = future_close.gather(1, hold_last.unsqueeze(1).expand(B, 1, N)).squeeze(1)
+    ret_timeout = (fc_gather - entry) / (entry + 1e-8)
+
+    raw_return = (tp_wins.float()   * ret_tp
+                + sl_wins.float()   * ret_sl
+                + timed_out.float() * ret_timeout)
+
+    raw_return = raw_return - spread_cost
+
+    return raw_return, tp_wins.float(), sl_wins.float(), timed_out.float()
+
+
+def simulate_short_return(
+    tp_mult:      torch.Tensor,   # [B, N]
+    sl_mult:      torch.Tensor,   #[B, N]
+    hold_bars:    torch.Tensor,   # [B, N]
+    entry_close:  torch.Tensor,   # [B, N]
+    entry_atr:    torch.Tensor,   # [B, N]
+    future_high:  torch.Tensor,   #[B, H, N]
+    future_low:   torch.Tensor,   # [B, H, N]
+    future_close: torch.Tensor,   # [B, H, N]
+    spread_cost:  float = 0.0001,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, H, N = future_high.shape
+    dev = entry_close.device
+
+    entry = entry_close
+    atr   = entry_atr.clamp(min=1e-8)
+
+    tp_price = entry - tp_mult * atr
+    sl_price = entry + sl_mult * atr
+
+    hold_int = hold_bars.detach().round().long().clamp(1, H)
+
+    tp_e = tp_price.unsqueeze(1).expand(B, H, N)
+    sl_e = sl_price.unsqueeze(1).expand(B, H, N)
+    fh, fl = future_high, future_low
+
+    tp_hit_mask = fl <= tp_e
+    sl_hit_mask = fh >= sl_e
+
+    tp_only_mask = tp_hit_mask & ~sl_hit_mask
+
+    bar_idx  = torch.arange(H, device=dev).view(1, H, 1).expand(B, H, N)
+    hold_e   = hold_int.unsqueeze(1).expand(B, H, N)
+    in_hold  = bar_idx < hold_e
+
+    tp_valid = tp_only_mask & in_hold
+    sl_valid = sl_hit_mask  & in_hold
+
+    INF = H
+    def _first(mask):
+        has  = mask.any(dim=1)
+        idx  = mask.float().argmax(dim=1)
+        return torch.where(has, idx, torch.full_like(idx, INF))
+
+    first_tp = _first(tp_valid)
+    first_sl = _first(sl_valid)
+
+    has_tp = (first_tp < INF)
+    has_sl = (first_sl < INF)
+
+    tp_wins  = has_tp & (~has_sl | (first_tp < first_sl))
+    sl_wins  = has_sl & ~tp_wins
+    timed_out= ~tp_wins & ~sl_wins
+
+    ret_tp  = tp_mult * atr / (entry + 1e-8)
+    ret_sl  = -sl_mult * atr / (entry + 1e-8)
+
+    hold_last = (hold_int - 1).clamp(0, H - 1)
+    fc_gather = future_close.gather(1, hold_last.unsqueeze(1).expand(B, 1, N)).squeeze(1)
+    ret_timeout = -(fc_gather - entry) / (entry + 1e-8)
+
+    raw_return = (tp_wins.float()   * ret_tp
+                + sl_wins.float()   * ret_sl
+                + timed_out.float() * ret_timeout)
+
+    raw_return = raw_return - spread_cost
+
+    return raw_return, tp_wins.float(), sl_wins.float(), timed_out.float()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. POLICY LOSS
+# ══════════════════════════════════════════════════════════════════════════════
+class TradingPolicyLoss(nn.Module):
+    def __init__(self,
+                 lambda_turn=LAMBDA_TURN, lambda_cvar=LAMBDA_CVAR,
+                 lambda_gate=LAMBDA_GATE, lambda_sl=LAMBDA_SL,
+                 cvar_q=CVAR_Q, gate_thresh=GATE_THRESH, dir_thresh=DIR_THRESH):
         super().__init__()
-        self.spread      = spread_bps * 1e-4   # convert bps to decimal
-        self.lambda_tc   = lambda_tc
+        self.lambda_turn = lambda_turn
         self.lambda_cvar = lambda_cvar
-        self.target_vol  = target_vol
-        self.quantile    = cvar_quantile
-        self.lambda_l2   = lambda_l2
+        self.lambda_gate = lambda_gate
+        self.lambda_sl   = lambda_sl
+        self.cvar_q      = cvar_q
+        self.gate_thresh = gate_thresh
+        self.dir_thresh  = dir_thresh
 
-    def forward(
-        self,
-        signal:   torch.Tensor,                     # [B, N, 1]  raw gated signal
-        targets:  torch.Tensor,                     # [B, S, N]  per-bar returns
-        prev_sig: Optional[torch.Tensor] = None,    # [B, N]     signal from prev chunk
-    ) -> torch.Tensor:
-        sig = signal.squeeze(-1)                     # [B, N]
+    def forward(self, action: Dict[str, torch.Tensor],
+                ret_long: torch.Tensor,
+                ret_short: torch.Tensor,
+                prev_action: Optional[Dict] = None) -> torch.Tensor:
 
-        # ── 1. Vol-scale position ──────────────────────────────────────────
-        realized_vol = targets.std(dim=1).clamp(min=1e-8)   # [B, N]
-        scale        = (self.target_vol / realized_vol).clamp(0.1, 3.0)
-        pos          = sig * scale                           # [B, N]
+        direction = action['direction']
+        gate      = action['gate']
+        size      = action['size']
+        sl_mult   = action['sl_mult']
 
-        # ── 2. Core PnL (on pre-computed targets) ─────────────────────────
-        r_net = targets.sum(dim=1)                          # [B, N]
-        pnl   = pos * r_net                                 # [B, N]
+        # Blend expected return
+        p_long = 0.5 * (direction + 1.0)
+        p_short = 1.0 - p_long
+        expected_return = p_long * ret_long + p_short * ret_short
 
-        # ── 3. Transaction cost (turnover) ────────────────────────────────
-        if prev_sig is not None:
-            turnover = (sig - prev_sig).abs().mean()        # scalar
+        # Soft trade activation aligned with eval
+        gate_soft = torch.sigmoid(12.0 * (gate - self.gate_thresh))
+        dir_soft  = torch.sigmoid(12.0 * (direction.abs() - self.dir_thresh))
+        trade_soft = gate_soft * dir_soft
+
+        pos = trade_soft * size * direction.abs()
+
+        # Core PnL scaled to bps
+        pnl = pos * expected_return * 1e4
+        loss_core = -pnl.mean()
+
+        # CVaR tail penalty
+        flat_pnl = pnl.view(-1)
+        k = max(1, int(self.cvar_q * flat_pnl.numel()))
+        worst = torch.topk(flat_pnl, k, largest=False).values
+        cvar_pen = self.lambda_cvar * (-worst.mean())
+
+        # Turnover penalty
+        if prev_action is not None:
+            turn_pen = self.lambda_turn * (
+                (direction - prev_action['direction']).abs().mean() +
+                (size      - prev_action['size']).abs().mean()
+            )
         else:
-            turnover = sig.abs().mean()                     # first chunk: full entry cost
-        tc_cost = self.lambda_tc * turnover * self.spread
+            turn_pen = torch.tensor(0., device=direction.device)
 
-        # ── 4. CVaR tail-risk penalty ──────────────────────────────────────
-        # Compute per-bar PnL proxy: pos (chunk-level) × per-bar return
-        pos_expanded = pos.unsqueeze(1).expand_as(targets)  # [B, S, N]
-        bar_pnl      = (pos_expanded * targets).view(-1)    # flatten all bars
-        # CVaR = mean of worst-q% outcomes (lower is more negative → bigger penalty)
-        k        = max(1, int(self.quantile * bar_pnl.numel()))
-        worst_k  = torch.topk(bar_pnl, k, largest=False).values
-        cvar     = -worst_k.mean()                          # positive scalar
-        cvar_pen = self.lambda_cvar * cvar
+        # Gate overtrading penalty
+        gate_pen = self.lambda_gate * gate.mean()
 
-        # ── 5. L2 on direction signal (prevents ±1 saturation) ────────────
-        l2_pen = self.lambda_l2 * (sig ** 2).mean()
+        # SL sanity (no ultra-tight stops)
+        sl_pen = self.lambda_sl * (1.0 / (sl_mult + 1e-6)).mean()
 
-        return -pnl.mean() + tc_cost + cvar_pen + l2_pen
+        loss = loss_core + cvar_pen + turn_pen + gate_pen + sl_pen
+        return loss
 
 
-# ==========================================
-# 8. SEQUENTIAL (CHUNK) DATASET
-# ==========================================
-class SequentialForexDataset(Dataset):
-    """
-    Non-overlapping, strictly chronological chunks.
-    Each item returns (features [S, N, F], future_returns [S, N]).
-    """
-    def __init__(self, X: np.ndarray, returns: np.ndarray, chunk_len: int):
-        self.X         = torch.FloatTensor(X)
-        self.returns   = torch.FloatTensor(returns)
-        self.chunk_len = chunk_len
-        self.n_chunks  = len(X) // chunk_len
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. DATASET
+# ══════════════════════════════════════════════════════════════════════════════
+class RollingWindowTradeDataset(Dataset):
+    def __init__(self, features: np.ndarray,          
+                 close_raw: np.ndarray,               
+                 atr_raw:   np.ndarray,               
+                 high_raw:  np.ndarray,               
+                 low_raw:   np.ndarray,               
+                 chunk_len: int = CHUNK_LEN,
+                 max_horizon: int = MAX_HOLD_CAP):
+        self.X  = torch.FloatTensor(features)
+        self.C  = torch.FloatTensor(close_raw)
+        self.A  = torch.FloatTensor(atr_raw)
+        self.H  = torch.FloatTensor(high_raw)
+        self.L  = torch.FloatTensor(low_raw)
+        self.chunk_len   = chunk_len
+        self.max_horizon = max_horizon
+        T = features.shape[0]
+        self.valid_t = list(range(chunk_len - 1, T - max_horizon))
 
-    def __len__(self) -> int:
-        return self.n_chunks
+    def __len__(self):
+        return len(self.valid_t)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        s = idx * self.chunk_len
-        e = s + self.chunk_len
-        return self.X[s:e], self.returns[s:e]
+    def __getitem__(self, idx):
+        t = self.valid_t[idx]
+        s = t - self.chunk_len + 1
 
+        x_window    = self.X[s : t+1]              
+        entry_close = self.C[t]                     
+        entry_atr   = self.A[t]                     
+        future_high = self.H[t+1 : t+1+self.max_horizon]  
+        future_low  = self.L[t+1 : t+1+self.max_horizon]  
+        future_close= self.C[t+1 : t+1+self.max_horizon]  
 
-# ==========================================
-# 9. METRICS
-# ==========================================
-def calculate_sharpe(signals: np.ndarray, returns: np.ndarray,
-                     periods_per_year: Optional[int] = None) -> float:
-    # Auto-detect annualization: caller can override, otherwise we infer from global
-    if periods_per_year is None:
-        periods_per_year = BARSPERYEAR_15M
-    pnl = signals * returns
-    mu  = np.mean(pnl)
-    sig = np.std(pnl)
-    return 0.0 if sig < 1e-8 else (mu / sig) * np.sqrt(periods_per_year)
+        return x_window, entry_close, entry_atr, future_high, future_low, future_close
 
 
-# ==========================================
-# 10. TRAINING — SEQUENTIAL WITH TBPTT
-# ==========================================
-def train_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: optim.Optimizer,
-    amp_scaler,
-    device: torch.device,
-    step_counter: int,
-) -> Tuple[float, float, int]:
-    """One full pass through training tape; carries state + prev_sig for TC penalty."""
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. DATA LOADING
+# ══════════════════════════════════════════════════════════════════════════════
+def load_titan_dataset_v6(path: str):
+    print(f"\n>>> Loading {os.path.basename(path)} ...")
+    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    print(f"    Shape: {df.shape} | {df.index[0]} → {df.index[-1]}")
+
+    pairs = []
+    for col in df.columns:
+        for p in['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD']:
+            if col.startswith(p + '_') and p not in pairs:
+                pairs.append(p)
+    if not pairs:
+        pairs =['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD']
+    print(f"    Pairs: {pairs}")
+
+    macro_cols =[c for c in df.columns
+                  if not any(c.startswith(p+'_') for p in pairs)]
+
+    node_arrays, close_arr_list, atr_arr_list = [], [], []
+    high_arr_list,  low_arr_list = [],[]
+    node_col_map = {}
+
+    for pair in pairs:
+        pair_cols =[c for c in df.columns if c.startswith(pair + '_')]
+        feat_cols = pair_cols + macro_cols
+        node_col_map[pair] = feat_cols
+
+        mat = df[feat_cols].values.astype(np.float32)
+        node_arrays.append(mat)
+
+        def _col(suffix):
+            c = f'{pair}_{suffix}'
+            return df[c].values.astype(np.float32) if c in df.columns else np.ones(len(df), dtype=np.float32)
+
+        close_arr_list.append(_col('Close'))
+        high_arr_list.append(_col('High'))
+        low_arr_list.append(_col('Low'))
+
+        if f'{pair}_atr14raw' in df.columns:
+            atr_arr_list.append(df[f'{pair}_atr14raw'].values.astype(np.float32))
+        elif f'{pair}_atr14n' in df.columns:
+            atr_arr_list.append((df[f'{pair}_atr14n'] * df[f'{pair}_Close']).values.astype(np.float32))
+        else:
+            lr = np.log(df[f'{pair}_Close'] / df[f'{pair}_Close'].shift(1)).fillna(0)
+            atr_arr_list.append((lr.rolling(14).std().fillna(method='bfill') *
+                                 df[f'{pair}_Close']).values.astype(np.float32))
+
+    T = len(df)
+    N = len(pairs)
+    feats_per_node = node_arrays[0].shape[1]
+    master = np.stack(node_arrays, axis=1)
+
+    close_raw = np.stack(close_arr_list, axis=1)
+    high_raw  = np.stack(high_arr_list,  axis=1)
+    low_raw   = np.stack(low_arr_list,   axis=1)
+    atr_raw   = np.stack(atr_arr_list,   axis=1)
+
+    dates = df.index
+    schema = {
+        'feats_per_node': feats_per_node,
+        'pairs': pairs,
+        'node_cols': node_col_map,
+        'macro_cols': macro_cols,
+    }
+
+    print(f"    Master: {master.shape} | feats/node: {feats_per_node}")
+    return master, close_raw, atr_raw, high_raw, low_raw, feats_per_node, dates, schema
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. TRAINING LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+def train_epoch_v6(model, loader, criterion, optimizer, device, use_amp=False):
     model.train()
-    total_loss  = 0.0
-    total_pnl   = 0.0
-    n_samples   = 0
-    prev_states = None
-    prev_sig    = None          # for transaction-cost turnover term
-    use_amp     = (device.type == 'cuda')
+    total_loss = 0.0
+    prev_action = None
+    step = 0
 
-    for x, r in loader:
-        x, r = x.to(device), r.to(device)
-        x    = torch.clamp(x + torch.randn_like(x) * NOISE_STD, -10.0, 10.0)
+    scaler_amp = torch.amp.GradScaler('cuda') if use_amp else None
+
+    for x_win, e_close, e_atr, f_high, f_low, f_close in loader:
+        # Strictly reset recurrent state across batched overlapping windows
+        prev_states = None
+
+        x_win   = x_win.to(device)
+        e_close = e_close.to(device)
+        e_atr   = e_atr.to(device)
+        f_high  = f_high.to(device)
+        f_low   = f_low.to(device)
+        f_close = f_close.to(device)
+
+        x_win = torch.clamp(x_win + torch.randn_like(x_win) * NOISE_STD, -10, 10)
 
         optimizer.zero_grad()
         if use_amp:
             with torch.amp.autocast('cuda'):
-                signal, current_states = model(x, prev_states=prev_states, step=step_counter)
-                loss = criterion(signal, r, prev_sig=prev_sig)
-            amp_scaler.scale(loss).backward()
-            amp_scaler.unscale_(optimizer)
+                act = model(x_win, prev_states, step)
+                ret_long, _, _, _ = simulate_long_return(
+                    act['tp_mult'], act['sl_mult'], act['hold_bars'],
+                    e_close, e_atr, f_high, f_low, f_close)
+                ret_short, _, _, _ = simulate_short_return(
+                    act['tp_mult'], act['sl_mult'], act['hold_bars'],
+                    e_close, e_atr, f_high, f_low, f_close)
+                
+                loss = criterion(act, ret_long, ret_short, prev_action)
+            scaler_amp.scale(loss).backward()
+            scaler_amp.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            amp_scaler.step(optimizer)
-            amp_scaler.update()
+            scaler_amp.step(optimizer)
+            scaler_amp.update()
         else:
-            signal, current_states = model(x, prev_states=prev_states, step=step_counter)
-            loss = criterion(signal, r, prev_sig=prev_sig)
+            act = model(x_win, prev_states, step)
+            ret_long, _, _, _ = simulate_long_return(
+                act['tp_mult'], act['sl_mult'], act['hold_bars'],
+                e_close, e_atr, f_high, f_low, f_close)
+            ret_short, _, _, _ = simulate_short_return(
+                act['tp_mult'], act['sl_mult'], act['hold_bars'],
+                e_close, e_atr, f_high, f_low, f_close)
+            
+            loss = criterion(act, ret_long, ret_short, prev_action)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-        prev_states  = [s.detach() for s in current_states]
-        prev_sig     = signal.squeeze(-1).detach()
+        prev_action  = {k: v.detach() for k, v in act.items() if k != 'states'}
         total_loss  += loss.item()
-        with torch.no_grad():
-            r_net      = r.sum(dim=1)            # [B, N]
-            total_pnl += (signal.squeeze(-1) * r_net).sum().item()
-        n_samples   += r.shape[0] * r.shape[2]
-        step_counter += 1
+        step        += 1
 
-    return total_loss / len(loader), total_pnl / max(n_samples, 1), step_counter
+    return total_loss / max(step, 1)
 
 
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-    initial_states=None,
-    periods_per_year: int = BARSPERYEAR_15M,
-):
-    """Evaluate sequentially; passes prev_sig for transaction-cost tracking."""
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. EVALUATION (trade-based metrics)
+# ══════════════════════════════════════════════════════════════════════════════
+def evaluate_v6(model, loader, criterion, device, periods_per_year=BARSPERYEAR_30M):
     model.eval()
-    total_loss  = 0.0
-    all_signals = []
-    all_returns = []
-    all_gates   = []
-    prev_states = initial_states
-    prev_sig    = None
+    total_loss = 0.0
+    step = 0
 
-    for x, r in loader:
-        x, r = x.to(device), r.to(device)
-        x    = torch.clamp(x, -10.0, 10.0)
-        signal, current_states = model(x, prev_states=prev_states)
-        loss         = criterion(signal, r, prev_sig=prev_sig)
-        prev_states  = current_states
-        prev_sig     = signal.squeeze(-1)
-        total_loss  += loss.item()
-        sig_chunk    = signal.squeeze(-1)    # [B, N]
-        r_net        = r.sum(dim=1)          # [B, N]
-        # Recover gate magnitude: |gated_sig| / (|direction| + eps)
-        # We can't separate direction from gate here, so just store |sig| as gate proxy
-        all_signals.append(sig_chunk.cpu().numpy().reshape(-1, NUM_NODES))
-        all_returns.append(r_net.cpu().numpy().reshape(-1, NUM_NODES))
-        all_gates.append(sig_chunk.abs().cpu().numpy().reshape(-1, NUM_NODES))
+    all_realized, all_mask     = [],[]
+    all_tp, all_sl, all_to     = [], [],[]
+    all_gate, all_size         = [],[]
+    all_tp_m, all_sl_m, all_h  = [], [],[]
 
-    if not all_signals:
-        empty = np.zeros((0, NUM_NODES), dtype=np.float32)
-        return 0.0, 0.0, prev_states, empty, empty
+    with torch.no_grad():
+        for x_win, e_close, e_atr, f_high, f_low, f_close in loader:
+            x_win   = x_win.to(device)
+            e_close = e_close.to(device)
+            e_atr   = e_atr.to(device)
+            f_high  = f_high.to(device)
+            f_low   = f_low.to(device)
+            f_close = f_close.to(device)
+            x_win   = torch.clamp(x_win, -10, 10)
 
-    sig_arr  = np.concatenate([a.reshape(-1, NUM_NODES) for a in all_signals], axis=0)
-    ret_arr  = np.concatenate([a.reshape(-1, NUM_NODES) for a in all_returns], axis=0)
-    gate_arr = np.concatenate([a.reshape(-1, NUM_NODES) for a in all_gates],   axis=0)
-    sharpe   = calculate_sharpe(sig_arr.flatten(), ret_arr.flatten(), periods_per_year)
-    return total_loss / max(len(loader), 1), sharpe, prev_states, sig_arr, ret_arr
+            act = model(x_win, prev_states=None)
+            ret_long, tp_l, sl_l, to_l = simulate_long_return(
+                act['tp_mult'], act['sl_mult'], act['hold_bars'],
+                e_close, e_atr, f_high, f_low, f_close)
+            ret_short, tp_s, sl_s, to_s = simulate_short_return(
+                act['tp_mult'], act['sl_mult'], act['hold_bars'],
+                e_close, e_atr, f_high, f_low, f_close)
 
+            loss = criterion(act, ret_long, ret_short)
 
-# ==========================================
-# 11. TRUE ONLINE EVOLUTION (bar-by-bar)
-# ==========================================
-def online_evolve(
-    model: nn.Module,
-    x_bar: torch.Tensor,                        # [1, 1, N, F]
-    observed_return: torch.Tensor,              # [1, 1, N]
-    prev_states: Optional[List[torch.Tensor]],
-    online_optimizer: optim.Optimizer,
-    device: torch.device,
-    prev_sig: Optional[torch.Tensor] = None,    # [1, N] — for turnover cost
-) -> Tuple[float, torch.Tensor, List[torch.Tensor], torch.Tensor]:
-    """
-    One-bar online weight update using the same RealPnLLoss objective,
-    but applied at single-bar granularity. Call after every live candle close.
-    """
-    model.train()
-    x_bar           = torch.clamp(x_bar, -10.0, 10.0).to(device)
-    observed_return = observed_return.to(device)
+            # Route metrics based on chosen direction
+            is_long = (act['direction'] >= 0).float()
+            is_short = 1.0 - is_long
 
-    online_optimizer.zero_grad()
-    signal, current_states = model(x_bar, prev_states=prev_states)
-    sig = signal.squeeze(-1)                             # [1, N]
+            realized = is_long * ret_long + is_short * ret_short
+            tp_h = is_long * tp_l + is_short * tp_s
+            sl_h = is_long * sl_l + is_short * sl_s
+            to_h = is_long * to_l + is_short * to_s
 
-    # Vol-scale position
-    rv    = observed_return.squeeze(1).abs().clamp(min=1e-8)  # [1, N] crude single-bar vol
-    scale = (TARGET_VOL / rv).clamp(0.1, 3.0)
-    pos   = sig * scale
+            trade_mask = ((act['gate'] > GATE_THRESH) &
+                          (act['direction'].abs() > DIR_THRESH)).float()
 
-    # Core PnL
-    pnl  = (pos * observed_return.squeeze(1)).mean()
+            all_realized.append(realized.cpu().numpy())
+            all_mask.append(trade_mask.cpu().numpy())
+            all_tp.append(tp_h.cpu().numpy())
+            all_sl.append(sl_h.cpu().numpy())
+            all_to.append(to_h.cpu().numpy())
+            all_gate.append(act['gate'].cpu().numpy())
+            all_size.append(act['size'].cpu().numpy())
+            all_tp_m.append(act['tp_mult'].cpu().numpy())
+            all_sl_m.append(act['sl_mult'].cpu().numpy())
+            all_h.append(act['hold_bars'].cpu().numpy())
 
-    # Turnover cost
-    if prev_sig is not None:
-        tc = LAMBDA_TC * (sig - prev_sig).abs().mean() * (SPREAD_BPS * 1e-4)
+            total_loss += loss.item()
+            step += 1
+
+    def cat(lst): return np.concatenate([a.reshape(-1) for a in lst])
+
+    realized_f = cat(all_realized)
+    mask_f     = cat(all_mask)
+    trades_idx = mask_f > 0.5
+    trades     = realized_f[trades_idx]
+
+    if len(trades) == 0:
+        sharpe = 0.0
     else:
-        tc = LAMBDA_TC * sig.abs().mean() * (SPREAD_BPS * 1e-4)
+        mu  = trades.mean()
+        std = trades.std() + 1e-9
+        sharpe = mu / std * math.sqrt(periods_per_year)
 
-    loss = -pnl + tc
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.25)
-    online_optimizer.step()
+    win_rate   = (trades > 0).mean() * 100 if len(trades) else 0
+    wins       = trades[trades > 0]
+    losses     = trades[trades < 0]
+    pf         = wins.sum() / (-losses.sum() + 1e-9) if len(losses) else float('inf')
+    total_ret  = trades.sum() * 100   
 
-    next_states = [s.detach() for s in current_states]
-    model.eval()
-    return loss.item(), signal.detach(), next_states, sig.detach()
+    # Max drawdown correctly computed on actual executed PnL path
+    executed_pnl_path = realized_f * mask_f
+    cum = np.cumsum(executed_pnl_path)
+    peak = np.maximum.accumulate(cum)
+    mdd  = ((peak - cum) / (np.abs(peak) + 1e-9)).max() * 100
 
+    tp_f = cat(all_tp)
+    sl_f = cat(all_sl)
+    to_f = cat(all_to)
 
-# ==========================================
-# 12. TRIPLE-BARRIER TARGET COMPUTATION
-# ==========================================
-def compute_triple_barrier_returns(
-    close: np.ndarray,       # [T] closing prices for one pair
-    k_tp:  float = K_TP,
-    k_sl:  float = K_SL,
-    max_hold: int = MAX_HOLD,
-    atr_period: int = ATR_PERIOD,
-) -> np.ndarray:
-    """
-    For each bar t, compute the realized return as:
-      +TP  if price hits take-profit barrier first      (long perspective)
-      -SL  if price hits stop-loss barrier first
-      ret[t+max_hold]  if neither barrier is hit within max_hold bars
-
-    Long TP  = entry + k_tp * ATR
-    Long SL  = entry - k_sl * ATR
-    The model signal is signed, so we return the LONG-perspective realized
-    return: multiply by -1 for shorts.
-
-    Returns float32 array of shape [T].
-    """
-    T = len(close)
-    if T < atr_period + 2:
-        return np.zeros(T, dtype=np.float32)
-
-    # ── ATR (simple TR-based, no High/Low in dataset so use bar-to-bar range) ──
-    returns = np.diff(close, prepend=close[0])
-    atr = pd.Series(np.abs(returns)).ewm(span=atr_period, adjust=False).mean().values.astype(np.float64)
-    atr = np.maximum(atr, 1e-8)
-
-    realized = np.zeros(T, dtype=np.float32)
-    close_f   = close.astype(np.float64)
-
-    for t in range(T - 1):
-        entry  = close_f[t]
-        tp_lvl = entry + k_tp * atr[t]
-        sl_lvl = entry - k_sl * atr[t]
-        end_t  = min(t + max_hold, T - 1)
-
-        outcome = (close_f[end_t] - entry) / (entry + 1e-12)  # default: expire
-        for j in range(t + 1, end_t + 1):
-            price = close_f[j]
-            if price >= tp_lvl:
-                outcome = k_tp * atr[t] / (entry + 1e-12)   # TP hit
-                break
-            if price <= sl_lvl:
-                outcome = -k_sl * atr[t] / (entry + 1e-12)  # SL hit
-                break
-        realized[t] = float(outcome)
-
-    return realized
-
-
-# ==========================================
-# 13. DATA LOADING  (auto-detects dataset & columns)
-# ==========================================
-def _find_dataset() -> str:
-    """Return the first CSV found in the script directory."""
-    here = os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() else '.'
-    candidates = [
-        'Titan15M_Dataset.csv',
-        'TitanForexDataset.csv',
-        'Titan_Dataset.csv',
-    ]
-    for c in candidates:
-        p = os.path.join(here, c)
-        if os.path.exists(p):
-            return p
-    # fallback: pick any CSV in the folder
-    csvs = [f for f in os.listdir(here) if f.endswith('.csv')]
-    if csvs:
-        return os.path.join(here, csvs[0])
-    raise FileNotFoundError(f"No CSV dataset found in {here}")
-
-
-def load_titan_dataset(path: str):
-    # ── auto-find file if the specified path doesn't exist ──────────────
-    if not os.path.exists(path):
-        path = _find_dataset()
-
-    print(f"\n>>> Loading {os.path.basename(path)} ...")
-    df = pd.read_csv(path, index_col=0, parse_dates=True).sort_index()
-    print(f"    Shape: {df.shape} | {df.index.min()} → {df.index.max()}")
-
-    # ── auto-detect target return column ────────────────────────────────
-    # We now strictly expect the 12-bar target from the new dataset builder
-    target_col = "target_EURUSD_ret_12"
-    if target_col in df.columns:
-        print(f"    Target column: {target_col}")
-        df = df.dropna(subset=[target_col])
+    # Base rates strictly on actual traded subsets
+    if len(trades) > 0:
+        tp_rate = tp_f[trades_idx].mean() * 100
+        sl_rate = sl_f[trades_idx].mean() * 100
+        to_rate = to_f[trades_idx].mean() * 100
     else:
-        print(f"    [WARNING] {target_col} not found! Falling back to raw processing.")
+        tp_rate = sl_rate = to_rate = 0.0
 
-    df = df.fillna(0)
+    gate_util= mask_f.mean() * 100
+    avg_size = cat(all_size).mean()
+    avg_tp_m = cat(all_tp_m).mean()
+    avg_sl_m = cat(all_sl_m).mean()
+    avg_hold = cat(all_h).mean()
 
-    # ── Keep only numeric columns (drops string columns like news/event names) ──
-    numeric_cols = set(df.select_dtypes(include=[np.number]).columns)
-    shared_cols = [
-        c for c in df.columns
-        if c in numeric_cols
-        and not any(c.startswith(p) for p in PAIRS)
-        and not c.startswith('target_')
-    ]
-
-    node_arrays = []
-    for pair in PAIRS:
-        pair_cols = [c for c in df.columns
-                     if c in numeric_cols
-                     and c.startswith(pair)
-                     and not c.startswith('target_')]
-        if not pair_cols:
-            pair_lower = pair.lower()
-            pair_cols = [c for c in df.columns
-                         if c in numeric_cols
-                         and c.startswith(pair_lower)
-                         and not c.startswith('target_')]
-        node_arrays.append(df[pair_cols + shared_cols].values)
-
-    # Guard: all nodes must have same feature count
-    min_feats = min(a.shape[1] for a in node_arrays)
-    node_arrays = [a[:, :min_feats] for a in node_arrays]
-
-    feats_per_node = min_feats
-    master         = np.stack(node_arrays, axis=1).astype(np.float32)  # [T, N, F]
-
-    # ── Future returns: triple-barrier OR fallback to dataset targets ──────
-    # Priority: compute triple-barrier returns from Close prices.
-    # Fallback: use pre-built target columns from the 15M dataset builder.
-    future_rets = []
-    tp_hits_total, sl_hits_total, expire_total = 0, 0, 0
-
-    for pair_idx, p in enumerate(PAIRS):
-        close_col = f"{p}_Close"
-        if close_col in df.columns:
-            close_arr  = df[close_col].ffill().bfill().values.astype(np.float64)
-            tb_rets    = compute_triple_barrier_returns(close_arr, K_TP, K_SL, MAX_HOLD, ATR_PERIOD)
-            # Stats
-            raw_per_bar = np.diff(close_arr, prepend=close_arr[0]) / (close_arr + 1e-12)
-            atr_est     = np.abs(raw_per_bar).mean()
-            tp_threshold = K_TP * atr_est
-            sl_threshold = K_SL * atr_est
-            tp_hits = int(np.sum(np.abs(tb_rets) >= tp_threshold * 0.9))
-            sl_hits = int(np.sum(tb_rets <= -sl_threshold * 0.9))
-            expires = len(tb_rets) - tp_hits - sl_hits
-            tp_hits_total += tp_hits; sl_hits_total += sl_hits; expire_total += expires
-            found = tb_rets
-            print(f"    [{p}] Triple-barrier targets: std={found.std():.5f}  "
-                  f"TP%={tp_hits/max(len(tb_rets),1)*100:.1f}  "
-                  f"SL%={sl_hits/max(len(tb_rets),1)*100:.1f}")
-        else:
-            cand = f"target_{p}_ret_12"
-            if cand in df.columns:
-                found = df[cand].fillna(0).values.astype(np.float32)
-                print(f"    [{p}] Fallback: {cand} (std={found.std():.5f})")
-            else:
-                print(f"    [{p}] WARNING: no Close col or target col found. Zeros.")
-                found = np.zeros(len(df), dtype=np.float32)
-        future_rets.append(found)
-
-    future_rets = np.stack(future_rets, axis=1).astype(np.float32)  # [T, N]
-    T_total = len(future_rets)
-    print(f"  Triple-barrier summary across all pairs:  "
-          f"TP%={tp_hits_total/(T_total*NUM_NODES+1)*100:.1f}  "
-          f"SL%={sl_hits_total/(T_total*NUM_NODES+1)*100:.1f}  "
-          f"Expired%={expire_total/(T_total*NUM_NODES+1)*100:.1f}")
-
-
-    # ── Save strict feature schema for live inference ────────────────────
-    schema_cols = {}
-    for pair_i, p in enumerate(PAIRS):
-        p_lo = p.lower()
-        p_cols = [c for c in df.columns
-                  if c in numeric_cols
-                  and (c.startswith(p) or c.startswith(p_lo))
-                  and not c.startswith('target_')]
-        schema_cols[p] = (p_cols + shared_cols)[:min_feats]
-
-    save_feature_schema(
-        'titan_feature_schema.json',
-        pairs=PAIRS,
-        feats_per_node=min_feats,
-        shared_cols=shared_cols,
-        node_cols=schema_cols,
+    metrics = dict(
+        loss=total_loss / max(step, 1),
+        sharpe=sharpe, total_ret=total_ret, mdd=mdd,
+        win_rate=win_rate, pf=pf,
+        tp_rate=tp_rate, sl_rate=sl_rate, to_rate=to_rate,
+        gate_util=gate_util, avg_size=avg_size,
+        avg_tp_m=avg_tp_m, avg_sl_m=avg_sl_m, avg_hold=avg_hold,
+        n_trades=len(trades),
     )
-    print(f"    Master tensor: {master.shape} | feats/node: {feats_per_node}")
-    print(f"    Pairs: {PAIRS} | shared cols: {len(shared_cols)}")
-    return master, future_rets, feats_per_node, df.index
+    return metrics
 
 
-# ==========================================
-# 13. MAIN — EVOLVING TRAINING LOOP
-# ==========================================
-if __name__ == "__main__":
-    print("\n" + "=" * 60)
-    print("TITAN-NL v4.1: Evolving Stateful Profit-Maximization")
-    print("=" * 60)
+def print_metrics(tag, m):
+    print(f"\n  {tag}")
+    print(f"    Loss={m['loss']:.5f}  Sharpe={m['sharpe']:.2f}  "
+          f"TotalRet={m['total_ret']:.3f}%  MDD={m['mdd']:.2f}%")
+    print(f"    WinRate={m['win_rate']:.1f}%  PF={m['pf']:.2f}  "
+          f"Trades={m['n_trades']}")
+    print(f"    TP={m['tp_rate']:.1f}%  SL={m['sl_rate']:.1f}%  "
+          f"TO={m['to_rate']:.1f}%  GateUtil={m['gate_util']:.1f}%")
+    print(f"    AvgSize={m['avg_size']:.3f}  "
+          f"AvgTP={m['avg_tp_m']:.2f}x  AvgSL={m['avg_sl_m']:.2f}x  "
+          f"AvgHold={m['avg_hold']:.1f}bars")
 
-    # ── Load ─────────────────────────────────────────────────────────────
-    master, future_returns, feats_per_node, dates = load_titan_dataset(DATASET_PATH)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. SHARPE HELPER
+# ══════════════════════════════════════════════════════════════════════════════
+def sharpe_from_trades(trade_returns, bpy=BARSPERYEAR_30M):
+    if len(trade_returns) < 2:
+        return 0.0
+    mu  = np.mean(trade_returns)
+    std = np.std(trade_returns) + 1e-9
+    return float(mu / std * math.sqrt(bpy))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 10. MAIN — TRAINING PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == '__main__':
+
+    (master, close_raw, atr_raw, high_raw, low_raw,
+     feats_per_node, dates, schema) = load_titan_dataset_v6(DATASET_PATH)
 
     train_mask = (dates >= TRAIN_START) & (dates <= TRAIN_END)
     val_mask   = (dates >= VAL_START)   & (dates <= VAL_END)
-    train_idx, val_idx = [np.where(m)[0] for m in [train_mask, val_mask]]
+    calib_mask = (dates >= CALIB_START) & (dates <= CALIB_END)
+    back_mask  = (dates >= BACKTEST_START) & (dates <= BACKTEST_END)
 
-    print(f"\n  Splits → Train: {len(train_idx):,}  Val: {len(val_idx):,} bars")
+    train_idx = np.where(train_mask)[0]
+    val_idx   = np.where(val_mask)[0]
+    calib_idx = np.where(calib_mask)[0]
+    back_idx  = np.where(back_mask)[0]
 
-    # ── Auto-detect bars-per-year for correct Sharpe annualization ───────
-    total_years = max((dates[-1] - dates[0]).days / 365.25, 0.1)
-    raw_bpy     = int(len(dates) / total_years)
-    if raw_bpy < 1500:
-        bars_per_year = 252          # daily
-    elif raw_bpy < 5000:
-        bars_per_year = 1440         # hourly
-    else:
-        bars_per_year = BARSPERYEAR_15M  # 15-minute
-    print(f"  Detected periodicity: {bars_per_year} bars/year  (daily=252, 15M=22176)")
+    print(f"\n  Splits — Train:{len(train_idx):,}  Val:{len(val_idx):,}  "
+          f"Calib:{len(calib_idx):,}  Backtest:{len(back_idx):,}")
 
-    # ── Scale (train stats only) ─────────────────────────────────────────
     N, Nodes, Feats = master.shape
     scaler = RobustScaler().fit(master[train_idx].reshape(-1, Feats))
     scaled = np.nan_to_num(
         scaler.transform(master.reshape(-1, Feats)).reshape(N, Nodes, Feats),
-        nan=0.0, posinf=5.0, neginf=-5.0
-    )
-    with open('titan_scaler.pkl', 'wb') as f:
+        nan=0., posinf=5., neginf=-5.)
+
+    with open('titan_v6_scaler.pkl', 'wb') as f:
         pickle.dump(scaler, f)
+    with open('titan_v6_schema.json', 'w') as f:
+        json.dump({**schema, 'chunk_len': CHUNK_LEN,
+                   'max_hold_cap': MAX_HOLD_CAP, 'd_model': D_MODEL,
+                   'num_layers': NUM_LAYERS, 'cms': CMS_CHUNK_SIZES}, f, indent=2)
+    print("  titan_v6_scaler.pkl + titan_v6_schema.json saved")
 
-    # ── Datasets ─────────────────────────────────────────────────────────
-    train_ds = SequentialForexDataset(scaled[train_idx], future_returns[train_idx], CHUNK_LEN)
-    val_ds   = SequentialForexDataset(scaled[val_idx],   future_returns[val_idx],   CHUNK_LEN)
+    def _mk(idx):
+        ds = RollingWindowTradeDataset(
+            scaled[idx], close_raw[idx], atr_raw[idx],
+            high_raw[idx], low_raw[idx])
+        return DataLoader(ds, batch_size=16, shuffle=False, drop_last=True)
 
-    print(f"  Chunks → Train: {len(train_ds)}  Val: {len(val_ds)}  (chunk_len={CHUNK_LEN})")
+    def _mk1(idx):   
+        ds = RollingWindowTradeDataset(
+            scaled[idx], close_raw[idx], atr_raw[idx],
+            high_raw[idx], low_raw[idx])
+        return DataLoader(ds, batch_size=1, shuffle=False)
 
-    # ── Data sanity check ─────────────────────────────────────────────────
-    tr_rets = future_returns[train_idx]
-    nonzero_pct = np.count_nonzero(tr_rets) / max(tr_rets.size, 1) * 100
-    print(f"\n  Return stats (train):")
-    print(f"    mean={tr_rets.mean():.6f}  std={tr_rets.std():.6f}")
-    print(f"    min={tr_rets.min():.4f}  max={tr_rets.max():.4f}")
-    print(f"    non-zero: {nonzero_pct:.1f}%")
-    if nonzero_pct < 1.0:
-        raise ValueError("future_returns are nearly all zero! Check _log_ret column in dataset.")
-    if len(train_ds) == 0:
-        raise ValueError(f"Train split has {len(train_idx)} bars but CHUNK_LEN={CHUNK_LEN}. "
-                         f"Reduce CHUNK_LEN to at most {len(train_idx) // 4}.")
+    train_loader = _mk(train_idx)
+    val_loader   = _mk1(val_idx)
+    calib_loader = _mk1(calib_idx)
+    back_loader  = _mk1(back_idx)
 
-    # Split the ~60 final trading days into calibration + backtest
-    calib_mask   = (dates >= CALIB_START)   & (dates <= CALIB_END)
-    backtest_mask= (dates >= BACKTEST_START) & (dates <= BACKTEST_END)
-    calib_idx    = np.where(calib_mask)[0]
-    backtest_idx = np.where(backtest_mask)[0]
+    print(f"  Train batches: {len(train_loader)}  "
+          f"Val samples: {len(val_loader.dataset)}")
 
-    calib_ds    = SequentialForexDataset(scaled[calib_idx],    future_returns[calib_idx],    CHUNK_LEN)
-    backtest_ds = SequentialForexDataset(scaled[backtest_idx], future_returns[backtest_idx], CHUNK_LEN)
-    calib_loader    = DataLoader(calib_ds,    batch_size=1, shuffle=False)
-    backtest_loader = DataLoader(backtest_ds, batch_size=1, shuffle=False)
-
-    print(f"  Calib bars: {len(calib_idx)}  ({len(calib_ds)} chunks)  "
-          f"| Backtest bars: {len(backtest_idx)}  ({len(backtest_ds)} chunks)")
-
-    # DataLoaders for train/val priming
-    train_loader    = DataLoader(train_ds, batch_size=1, shuffle=False, drop_last=True)
-    val_loader      = DataLoader(val_ds,   batch_size=1, shuffle=False)
-
-    # ── Model ─────────────────────────────────────────────────────────────
-    model = NestedGraphTitanNL(
+    model = NestedGraphTitanV6(
         num_nodes=NUM_NODES, feats_per_node=feats_per_node,
-        d_model=D_MODEL, num_layers=2, dropout=0.3,
-        cms_chunk_sizes=CMS_CHUNK_SIZES
-    ).to(DEVICE)
+        d_model=D_MODEL, num_layers=NUM_LAYERS, dropout=0.3,
+        cms_chunk_sizes=CMS_CHUNK_SIZES).to(DEVICE)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"\n  Model Parameters: {total_params:,}")
+    total_p = sum(p.numel() for p in model.parameters())
+    print(f"  Model Parameters: {total_p:,}")
 
-    criterion = RealPnLLoss()
-    optimizer = M3Optimizer(model.parameters(), lr=LR, betas=(0.9, 0.95, 0.999), weight_decay=1e-3)
-    amp_scaler = torch.amp.GradScaler('cuda') if DEVICE.type == 'cuda' else None
+    criterion = TradingPolicyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR*0.05)
 
-    # ── Training ──────────────────────────────────────────────────────────
-    best_val_loss = float('inf')
-    patience_ctr  = 0
-    step_ctr      = 0
+    use_amp = DEVICE.type == 'cuda' and torch.cuda.is_bf16_supported()
 
     print(f"\n{'='*60}")
-    print(f"PHASE 1: Historical Calibration ({EPOCHS} epochs)")
-    print(f"{'='*60}\n")
+    print(f"PHASE 1: Training  ({EPOCHS} epochs, patience={PATIENCE})")
+    print(f"{'='*60}")
 
-    for epoch in range(EPOCHS):
-        tr_loss, tr_pnl, step_ctr = train_epoch(
-            model, train_loader, criterion, optimizer, amp_scaler, DEVICE, step_ctr
-        )
-        val_loss, val_sharpe, _, _, _ = evaluate(model, val_loader, criterion, DEVICE,
-                                                  periods_per_year=bars_per_year)
+    best_sharpe  = -1e9
+    no_improve   = 0
+    save_name    = 'Best_TITANv6_EXPLORATION.pth' if EXPLORATION_ONLY else 'Best_TITANv6_EVOLVING.pth'
 
-        print(f"Epoch {epoch+1:02d}/{EPOCHS} | "
-              f"Loss {tr_loss:.4e}/{val_loss:.4e} | "
-              f"PnL/chunk {tr_pnl*100:.4f}% | "
-              f"Val Sharpe {val_sharpe:.4f}")
+    for epoch in range(1, EPOCHS + 1):
+        tr_loss = train_epoch_v6(
+            model, train_loader, criterion, optimizer, DEVICE, use_amp=use_amp)
+        scheduler.step()
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_ctr  = 0
-            torch.save(model.state_dict(), 'Best_TITAN_EVOLVING.pth')
-            print("  >> Best model saved.")
+        val_m = evaluate_v6(model, val_loader, criterion, DEVICE,
+                            periods_per_year=BARSPERYEAR)
+        sharpe = val_m['sharpe']
+
+        print(f"Epoch {epoch:02d}/{EPOCHS} | "
+              f"TrLoss={tr_loss:.5f}  ValLoss={val_m['loss']:.5f} | "
+              f"ValSharpe={sharpe:.4f}  "
+              f"WinRate={val_m['win_rate']:.1f}%  "
+              f"Trades={val_m['n_trades']}")
+
+        if sharpe > best_sharpe:
+            best_sharpe = sharpe
+            no_improve  = 0
+            torch.save(model.state_dict(), save_name)
+            print(f"  >> Best model saved → {save_name}  (Sharpe={sharpe:.4f})")
         else:
-            patience_ctr += 1
-            if patience_ctr >= PATIENCE:
-                print(f"\n  Early stop at epoch {epoch+1}")
+            no_improve += 1
+            if no_improve >= PATIENCE:
+                print(f"\n  Early stop at epoch {epoch}")
                 break
 
-    # ── Phase 2a: OOS Calibration (first ~30 days of Q4 2024) ────────────
-    print("\n" + "=" * 60)
-    print("PHASE 2: Walk-Forward OOS + Calibration + Backtest")
-    print("=" * 60)
+    print(f"\n{'='*60}")
+    print(f"PHASE 2: Walk-Forward Calibration + Backtest")
+    print(f"{'='*60}")
 
-    model.load_state_dict(torch.load('Best_TITAN_EVOLVING.pth', weights_only=True))
+    model.load_state_dict(torch.load(save_name, map_location=DEVICE, weights_only=True))
 
-    # Prime memory through full history chronologically
-    print("  [1/3] Priming on train data...")
-    _, _, states, _, _  = evaluate(model, train_loader, criterion, DEVICE,
-                                   periods_per_year=bars_per_year)
-    print("  [2/3] Priming on val data  (Jan–Sep 2024)...")
-    _, _, states, _, _  = evaluate(model, val_loader, criterion, DEVICE, states,
-                                   periods_per_year=bars_per_year)
-
-    # ── Calibration window: Oct 1 – Nov 14 2024 ──────────────────────────
-    print(f"  [3/3] Calibration window ({CALIB_START} – {CALIB_END})...")
+    print(f"  [1/2] Calibration fine-tune ({CALIB_START} – {CALIB_END})...")
     calib_opt = optim.AdamW(model.parameters(), lr=ONLINE_LR * 10, weight_decay=1e-4)
-    calib_pnl_hist  = []
-    calib_prev_sig  = None
-    for x_c, r_c in calib_loader:
-        x_c, r_c = x_c.to(DEVICE), r_c.to(DEVICE)
-        model.train()
-        calib_opt.zero_grad()
-        sig_c, states = model(x_c, prev_states=states)
-        states  = [s.detach() for s in states]
-        loss_c  = criterion(sig_c, r_c, prev_sig=calib_prev_sig)
-        loss_c.backward()
+    prev_act  = None
+    for x_win, e_close, e_atr, f_high, f_low, f_close in calib_loader:
+        x_win, e_close, e_atr = x_win.to(DEVICE), e_close.to(DEVICE), e_atr.to(DEVICE)
+        f_high, f_low, f_close = f_high.to(DEVICE), f_low.to(DEVICE), f_close.to(DEVICE)
+        model.train(); calib_opt.zero_grad()
+
+        act = model(x_win, prev_states=None)
+        ret_long, _, _, _ = simulate_long_return(
+            act['tp_mult'], act['sl_mult'], act['hold_bars'],
+            e_close, e_atr, f_high, f_low, f_close)
+        ret_short, _, _, _ = simulate_short_return(
+            act['tp_mult'], act['sl_mult'], act['hold_bars'],
+            e_close, e_atr, f_high, f_low, f_close)
+
+        loss = criterion(act, ret_long, ret_short, prev_act)
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         calib_opt.step()
-        calib_prev_sig = sig_c.squeeze(-1).detach()
-        with torch.no_grad():
-            pnl_c = (sig_c.squeeze(-1) * r_c.sum(dim=1)).mean().item()
-            calib_pnl_hist.append(pnl_c)
-    calib_pnl_mean = np.mean(calib_pnl_hist) * 100 if calib_pnl_hist else 0.0
-    print(f"    Calibration avg PnL/chunk: {calib_pnl_mean:.4f}%")
+        prev_act= {k: v.detach() for k, v in act.items() if k != 'states'}
 
-    # ── Backtest: Nov 15 – Dec 31 2024 ───────────────────────────────────
-    print(f"\n  Backtesting ({BACKTEST_START} – {BACKTEST_END})...")
-    _, bt_sharpe, _, sig_arr, ret_arr = evaluate(
-        model, backtest_loader, criterion, DEVICE, states, periods_per_year=bars_per_year
-    )
+    model.eval()
+    print(f"\n  [2/2] Backtest ({BACKTEST_START} – {BACKTEST_END})...")
+    bt_m = evaluate_v6(model, back_loader, criterion, DEVICE, periods_per_year=BARSPERYEAR)
+    print_metrics("BACKTEST", bt_m)
 
-    n_bt = sig_arr.shape[0]
-    gate_util = (np.abs(sig_arr) > 0.05).mean() * 100   # bars where gate was meaningfully open
-    print(f"\nBacktest: {n_bt} chunks  |  Portfolio Sharpe: {bt_sharpe:.4f}  "
-          f"|  Gate utilisation: {gate_util:.1f}%\n")
-    print(f"  {'Pair':<8} {'Sharpe':>8} {'WinRate':>9} {'AvgSig':>8} {'PnL%':>9}")
-    print(f"  {'-'*46}")
-    for i, pair in enumerate(PAIRS):
-        ps  = calculate_sharpe(sig_arr[:, i], ret_arr[:, i], bars_per_year)
-        wr  = np.mean(np.sign(sig_arr[:, i]) == np.sign(ret_arr[:, i])) * 100
-        avg = np.abs(sig_arr[:, i]).mean()
-        cum_pnl_pct = (sig_arr[:, i] * ret_arr[:, i]).sum() * 100
-        print(f"  {pair:<8} {ps:>8.3f} {wr:>8.1f}% {avg:>8.4f} {cum_pnl_pct:>8.4f}%")
-
-    final_states = states  # carry calibrated state forward
-
-    # ── Persist state + model for live trading ────────────────────────────
-    torch.save(final_states, 'titan_final_memory_state.pt')
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'config': {
-            'num_nodes': NUM_NODES, 'd_model': D_MODEL,
-            'cms_chunk_sizes': CMS_CHUNK_SIZES,
-            'feats_per_node': feats_per_node,
-            'pairs': PAIRS,
-        }
-    }, 'titan_nl_complete.pth')
-
-    print("\n" + "=" * 60)
-    print("PHASE 3: True Online Evolution Demo (last 500 test bars)")
-    print("=" * 60)
-    print("(In production: call online_evolve() after every live candle close)")
-    print()
-
-    # Small AdamW for the online phase — we want tiny, clean nudges
-    online_opt = optim.AdamW(model.parameters(), lr=ONLINE_LR, weight_decay=1e-4)
-
-    x_data  = torch.FloatTensor(scaled[backtest_idx])         # [T, N, F]
-    r_data  = torch.FloatTensor(future_returns[backtest_idx]) # [T, N]
-    live_states = final_states
-
-    total_live_pnl = 0.0
-    demo_bars  = min(500, len(backtest_idx) - 1)
-    live_prev_sig = None
-
-    for bar_idx in range(demo_bars):
-        x_bar   = x_data[bar_idx].unsqueeze(0).unsqueeze(0).to(DEVICE)   # [1,1,N,F]
-        ret_bar = r_data[bar_idx].unsqueeze(0).unsqueeze(0).to(DEVICE)   # [1,1,N]
-
-        loss_val, sig, live_states, live_prev_sig = online_evolve(
-            model, x_bar, ret_bar, live_states, online_opt, DEVICE,
-            prev_sig=live_prev_sig
-        )
-        bar_pnl = (sig.squeeze() * ret_bar.squeeze()).mean().item()
-        total_live_pnl += bar_pnl
-
-    avg_live_pnl = total_live_pnl / demo_bars
-    print(f"  Live simulation over {demo_bars} bars complete.")
-    print(f"  Average PnL/bar: {avg_live_pnl:.6f}")
-    print(f"\nSave `Best_TITAN_EVOLVING.pth` + `titan_final_memory_state.pt` for live deployment.")
-    print("\nTITAN-NL v5.0 COMPLETE.")
+    final_name = 'Best_TITANv6_EVOLVING.pth'
+    torch.save(model.state_dict(), final_name)
+    print(f"\n  {final_name}  saved")
+    print(f"\n{'='*60}")
+    print("TITAN-NL v6.1 TRAINING COMPLETE")
+    print("Download: Best_TITANv6_EVOLVING.pth  titan_v6_scaler.pkl  titan_v6_schema.json")
+    print(f"{'='*60}")
