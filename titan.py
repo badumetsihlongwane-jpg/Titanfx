@@ -218,15 +218,17 @@ BARSPERYEAR     = BARSPERYEAR_30M
 SPREAD_BPS    = 1.0
 LAMBDA_TURN   = 0.01
 LAMBDA_CVAR   = 0.01
-LAMBDA_GATE   = 1e-4
+LAMBDA_GATE   = 5e-4
 LAMBDA_SL     = 1e-4
-LAMBDA_DIR    = 0.05
-DIR_TARGET_SCALE = 3500.0
-OPPORTUNITY_BPS_FLOOR = 0.30
-LAMBDA_OPPORTUNITY = 0.02
+LAMBDA_DIR    = 0.01
+DIR_TARGET_SCALE = 600.0
+OPPORTUNITY_BPS_FLOOR = 0.50
+OPPORTUNITY_BPS_CAP = 8.0
+LAMBDA_OPPORTUNITY = 0.002
 CVAR_Q        = 0.10
-GATE_THRESH   = 0.20
-DIR_THRESH    = 0.01
+GATE_THRESH   = 0.55
+DIR_THRESH    = 0.08
+SIZE_THRESH   = 0.05
 
 # Dataset search
 try:
@@ -496,7 +498,9 @@ class TradingPolicyLoss(nn.Module):
                  lambda_opp=LAMBDA_OPPORTUNITY,
                  dir_target_scale=DIR_TARGET_SCALE,
                  opportunity_bps_floor=OPPORTUNITY_BPS_FLOOR,
-                 cvar_q=CVAR_Q, gate_thresh=GATE_THRESH, dir_thresh=DIR_THRESH):
+                 opportunity_bps_cap=OPPORTUNITY_BPS_CAP,
+                 cvar_q=CVAR_Q, gate_thresh=GATE_THRESH,
+                 dir_thresh=DIR_THRESH, size_thresh=SIZE_THRESH):
         super().__init__()
         self.lambda_turn = lambda_turn
         self.lambda_cvar = lambda_cvar
@@ -506,9 +510,11 @@ class TradingPolicyLoss(nn.Module):
         self.lambda_opp  = lambda_opp
         self.dir_target_scale = dir_target_scale
         self.opportunity_bps_floor = opportunity_bps_floor
+        self.opportunity_bps_cap = opportunity_bps_cap
         self.cvar_q      = cvar_q
         self.gate_thresh = gate_thresh
         self.dir_thresh  = dir_thresh
+        self.size_thresh = size_thresh
 
     def forward(self, action: Dict[str, torch.Tensor],
                 ret_long: torch.Tensor,
@@ -529,7 +535,8 @@ class TradingPolicyLoss(nn.Module):
         # Soft trade activation aligned with eval
         gate_soft = torch.sigmoid(12.0 * (gate - self.gate_thresh))
         dir_soft  = torch.sigmoid(12.0 * (direction.abs() - self.dir_thresh))
-        trade_soft = gate_soft * dir_soft
+        size_soft = torch.sigmoid(18.0 * (size - self.size_thresh))
+        trade_soft = gate_soft * dir_soft * size_soft
 
         pos = trade_soft * size * direction.abs()
 
@@ -565,7 +572,8 @@ class TradingPolicyLoss(nn.Module):
         # Reward opening trades only where long/short edge is materially different
         opportunity_bps = edge.detach().abs() * 1e4
         opportunity = F.relu(opportunity_bps - self.opportunity_bps_floor)
-        opp_bonus = self.lambda_opp * (trade_soft * opportunity).mean()
+        opportunity = torch.clamp(opportunity, max=self.opportunity_bps_cap)
+        opp_bonus = self.lambda_opp * (pos * opportunity).mean()
 
         loss = loss_core + cvar_pen + turn_pen + gate_pen + sl_pen + dir_pen - opp_bonus
         return loss
@@ -785,9 +793,12 @@ def evaluate_v6(model, loader, criterion, device, periods_per_year=BARSPERYEAR_3
             to_h = is_long * to_l + is_short * to_s
 
             trade_mask = ((act['gate'] > GATE_THRESH) &
-                          (act['direction'].abs() > DIR_THRESH)).float()
+                          (act['direction'].abs() > DIR_THRESH) &
+                          (act['size'] > SIZE_THRESH)).float()
+            exec_weight = trade_mask * act['size'] * act['direction'].abs()
+            realized_exec = realized * exec_weight
 
-            all_realized.append(realized.cpu().numpy())
+            all_realized.append(realized_exec.cpu().numpy())
             all_mask.append(trade_mask.cpu().numpy())
             all_tp.append(tp_h.cpu().numpy())
             all_sl.append(sl_h.cpu().numpy())
